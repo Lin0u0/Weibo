@@ -344,6 +344,9 @@ import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.FeedDisplaySettingsStore
 import com.example.myweibo.data.ReadingPreferences
 import com.example.myweibo.data.ReadingPreferencesStore
+import com.example.myweibo.data.LocalViboDockState
+import com.example.myweibo.data.ViboDockItem
+import com.example.myweibo.data.rememberViboDockPreferencesState
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.MentionSuggestionCacheStore
 import com.example.myweibo.data.SearchHistoryStore
@@ -2679,6 +2682,7 @@ private sealed interface NavOverlayKind {
     data object MediaPreview : NavOverlayKind
     data object Article : NavOverlayKind
     data object TabSwitch : NavOverlayKind
+    data object DockSearch : NavOverlayKind
 }
 
 private enum class OverlayTop {
@@ -2700,7 +2704,7 @@ private fun overlayTopKind(stack: List<NavOverlayKind>): OverlayTop = when (stac
     NavOverlayKind.AlbumViewer -> OverlayTop.AlbumViewer
     NavOverlayKind.MediaPreview -> OverlayTop.MediaPreview
     NavOverlayKind.Article -> OverlayTop.Article
-    NavOverlayKind.TabSwitch, null -> OverlayTop.None
+    NavOverlayKind.TabSwitch, NavOverlayKind.DockSearch, null -> OverlayTop.None
 }
 
 private fun navOverlayKindsMatch(a: NavOverlayKind?, b: NavOverlayKind?): Boolean {
@@ -5555,11 +5559,10 @@ fun WeiboApp() {
         val exitingKind = navOverlayStack.lastOrNull()
         nestedDetailReturnAnimating = !albumDetailSwipeReturn && exitingKind is NavOverlayKind.Detail &&
             navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
-        // TabSwitch records the page to restore after opening a topic search, but it
-        // has no NavAnimatedOverlay to finish an exit and clear this pending state.
+        // Search return entries have no NavAnimatedOverlay to finish an exit and clear this pending state.
         // Leaving it pending makes feedUiOnTop permanently false when returning home.
         navExitPendingKind = exitingKind?.takeUnless {
-            it == NavOverlayKind.TabSwitch ||
+            (it == NavOverlayKind.TabSwitch || it == NavOverlayKind.DockSearch) ||
                 (albumDetailSwipeReturn && it is NavOverlayKind.Detail &&
                     navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail)
         }
@@ -5632,7 +5635,7 @@ fun WeiboApp() {
         if (exitingKind == NavOverlayKind.AlbumViewer) {
             albumDismissScrollTarget = null
         }
-        if (exitingKind == NavOverlayKind.TabSwitch &&
+        if ((exitingKind == NavOverlayKind.TabSwitch || exitingKind == NavOverlayKind.DockSearch) &&
             previous.detail?.instanceKey == currentDetailSnapshot()?.instanceKey &&
             previous.visitedProfile?.userId == visitedUserId
         ) {
@@ -5699,6 +5702,22 @@ fun WeiboApp() {
 
     fun closeFollowList() {
         navigateBack()
+    }
+
+    fun leaveRetainedSearchForTabSwitch() {
+        if (selectedTab != MainTab.Search) return
+        val kind = navOverlayStack.lastOrNull()
+        if (kind != NavOverlayKind.DockSearch && kind != NavOverlayKind.TabSwitch) return
+        // Explicit tab or timeline selection leaves Search; only Back restores its source.
+        navStack = emptyList()
+        navOverlayStack = emptyList()
+        navEnterPendingKind = null
+        navExitPendingKind = null
+        selectedItem = null
+        if (visitedUserId != null) clearVisitedProfileState()
+        searchReturnBackground = null
+        searchPendingQuery = null
+        searchPendingMode = null
     }
 
     fun dismissFollowListForTabSwitch() {
@@ -8577,6 +8596,15 @@ fun WeiboApp() {
         typography = MaterialTheme.typography,
     ) {
     val pollController = remember(session, activeAccountId) { PollUiController(session) }
+    val dockState = rememberViboDockPreferencesState()
+    LaunchedEffect(dockState.preferences.visibleItems) {
+        val current = when (selectedTab) {
+            MainTab.Messages -> ViboDockItem.MESSAGES
+            MainTab.Compose -> ViboDockItem.COMPOSE
+            else -> null
+        }
+        if (current != null && current !in dockState.preferences.visibleItems) selectedTab = MainTab.Feed
+    }
     CompositionLocalProvider(
         LocalPollController provides pollController,
         LocalProfileRetainedUi provides remember { mutableMapOf<String, ProfileRetainedUi>() },
@@ -8586,6 +8614,7 @@ fun WeiboApp() {
                 navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
             ),
         LocalHomeTimelineReadingState provides homeTimeline,
+        LocalViboDockState provides dockState,
         LocalShowCommentLikeCount provides showCommentLikeCount,
         LocalSetShowCommentLikeCount provides { enabled ->
             showCommentLikeCount = enabled
@@ -8754,9 +8783,10 @@ fun WeiboApp() {
             val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
             val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
             val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
-            val topicSearchOnTop = selectedTab == MainTab.Search &&
-                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
-            val searchUiOnTop = selectedTab == MainTab.Search && (topicSearchOnTop || (
+            val retainedSearchOnTop = selectedTab == MainTab.Search &&
+                (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch ||
+                    navOverlayStack.lastOrNull() == NavOverlayKind.DockSearch)
+            val searchUiOnTop = selectedTab == MainTab.Search && (retainedSearchOnTop || (
                 visitedUserId == null &&
                 detailOverlayItem == null &&
                 followListOverlay == null &&
@@ -8864,7 +8894,7 @@ fun WeiboApp() {
                 !detailOverlayVisible &&
                 (navExitPendingKind == null || navExitPendingKind is NavOverlayKind.Detail && !detailLayerActive)
             val retainFeedBehindSearch = selectedTab == MainTab.Search &&
-                navOverlayStack.any { it == NavOverlayKind.TabSwitch } &&
+                navOverlayStack.any { it == NavOverlayKind.TabSwitch || it == NavOverlayKind.DockSearch } &&
                 navStack.any { it.selectedTab == MainTab.Feed }
             val keepFeedAlive = retainFeedBehindSearch || selectedTab == MainTab.Feed && (
                 (visitedUserId != null && detailOverlayItem == null) ||
@@ -9865,14 +9895,14 @@ fun WeiboApp() {
             }
             // A nested detail pop returns to another detail and keeps the main controls hidden.
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
-            val topicSearchForeground = topicSearchOnTop
+            val retainedSearchForeground = retainedSearchOnTop
             // Keep the source bar intact until the incoming profile has covered it.
             val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
                 navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
             val bottomBarNavVisible = if (selectedTab == MainTab.Messages) {
                 messagesInboxRoute
             } else {
-                !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
+                !userPostsSearchLayerActive && (retainedSearchForeground || profileEnteringFromMain ||
                     ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
                         (selectedItem == null || detailExiting || detailSwipeReturningHome)))
             }
@@ -10161,6 +10191,7 @@ fun WeiboApp() {
             ) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
+                    dockPreferences = LocalViboDockState.current.preferences,
                     darkSurfaceOverride = darkTheme && selectedTab == MainTab.Messages && messagesInboxRoute,
                     backdrop = when {
                         selectedTab == MainTab.Feed -> homeBottomBarBackdrop
@@ -10176,11 +10207,21 @@ fun WeiboApp() {
                     selectedTimelineKind = homeTimeline.timelineKind,
                     selectedTimelineLabel = homeTimeline.timelineGroups.firstOrNull { it.id == homeTimeline.selectedTimelineGroupId }?.name,
                     onTimelineKindChange = { kind ->
+                        leaveRetainedSearchForTabSwitch()
                         dismissFollowListForTabSwitch()
                         selectedTab = MainTab.Feed
                         switchTimelineKind(kind)
                     },
-                    onTabChange = { tab ->
+                    onTabChange = tabChange@{ tab ->
+                        if (tab == MainTab.Search && selectedTab != MainTab.Search) {
+                            // Retain the source without borrowing topic search’s results-back behavior.
+                            pushNavigation(NavOverlayKind.DockSearch) {
+                                selectedTab = MainTab.Search
+                                bottomBarVisible = true
+                                bottomBarScrollDistance[0] = 0f
+                            }
+                            return@tabChange
+                        }
                         if (selectedTab == MainTab.Feed && tab == MainTab.Mine) {
                             // Retain decoded thumbnails before the feed's lazy rows unmount.
                             homeThumbnailStore.releaseSnapshot()
@@ -10188,19 +10229,7 @@ fun WeiboApp() {
                         }
                         bottomBarVisible = true
                         bottomBarScrollDistance[0] = 0f
-                        if (tab != selectedTab && topicSearchForeground) {
-                            // Explicit tab navigation leaves the retained source
-                            // stack; only Back should return to its detail page.
-                            navStack = emptyList()
-                            navOverlayStack = emptyList()
-                            navEnterPendingKind = null
-                            navExitPendingKind = null
-                            selectedItem = null
-                            if (visitedUserId != null) clearVisitedProfileState()
-                            searchReturnBackground = null
-                            searchPendingQuery = null
-                            searchPendingMode = null
-                        }
+                        if (tab != selectedTab) leaveRetainedSearchForTabSwitch()
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
                             if (tab == MainTab.Feed && visitedUserId != null) {
@@ -10249,6 +10278,7 @@ fun WeiboApp() {
                                         separatorBefore = index > 0,
                                         onClick = {
                                             dismiss()
+                                            leaveRetainedSearchForTabSwitch()
                                             dismissFollowListForTabSwitch()
                                             selectedTab = MainTab.Feed
                                             switchTimelineKind(kind)
@@ -10289,6 +10319,7 @@ fun WeiboApp() {
                                                 selected = homeTimeline.selectedTimelineGroupId == group.id,
                                                 onClick = {
                                                     dismiss()
+                                                    leaveRetainedSearchForTabSwitch()
                                                     dismissFollowListForTabSwitch()
                                                     switchTimelineGroup(group)
                                                 },
@@ -10308,6 +10339,7 @@ fun WeiboApp() {
                                         separatorBefore = index > 0 || homeTimeline.timelineGroups.isEmpty(),
                                         onClick = {
                                             dismiss()
+                                            leaveRetainedSearchForTabSwitch()
                                             dismissFollowListForTabSwitch()
                                             selectedTab = MainTab.Feed
                                             switchTimelineKind(kind)
@@ -25492,6 +25524,12 @@ private fun SettingsScreen(
                     )
                 }
                 item {
+                    val dock = LocalViboDockState.current
+                    SettingsPlainCard {
+                        ViboDockSettings(dock.preferences, dock::update, Modifier.padding(12.dp))
+                    }
+                }
+                item {
                     SettingsBottomBarGlassCard(
                         frostAmount = bottomBarFrostAmount,
                         onFrostChange = onBottomBarFrostAmountChange,
@@ -25708,14 +25746,11 @@ private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
 @Composable
 private fun SettingsAboutCard(versionName: String) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     var expanded by remember { mutableStateOf(false) }
-    var checking by remember { mutableStateOf(false) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
-    var newerVersion by remember { mutableStateOf<String?>(null) }
     val actionsBringIntoView = remember { BringIntoViewRequester() }
     var actionsHeight by remember { mutableIntStateOf(0) }
-    LaunchedEffect(expanded, actionsHeight, updateMessage, newerVersion) {
+    LaunchedEffect(expanded, actionsHeight, updateMessage) {
         if (expanded && actionsHeight > 0) {
             // Wait for the expanded/result layout, then reveal the entire action
             // area through the owning LazyColumn rather than requiring a new swipe.
@@ -25755,7 +25790,7 @@ private fun SettingsAboutCard(versionName: String) {
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    text = "MyWeibo · 版本 $versionName",
+                    text = "Vibo · 版本 $versionName",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -25770,33 +25805,8 @@ private fun SettingsAboutCard(versionName: String) {
             Modifier.fillMaxWidth().padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            TextButton(onClick = { openGitHub(com.example.myweibo.data.WeiboGitHubUrl) }) { Text("GitHub主页") }
-            TextButton(
-                enabled = !checking,
-                onClick = {
-                    checking = true
-                    updateMessage = null
-                    newerVersion = null
-                    scope.launch {
-                        try {
-                            val latest = com.example.myweibo.data.latestWeiboRelease()
-                            val localCode = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
-                            if (com.example.myweibo.data.isWeiboUpdateAvailable(versionName, localCode, latest)) {
-                                newerVersion = latest.version
-                                updateMessage = "发现新版本 ${latest.version}（${latest.versionCode ?: ""}），当前 $versionName（$localCode）"
-                            } else updateMessage = "当前已是最新版本（Release：${latest.version}）"
-                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                            throw cancelled
-                        } catch (error: Exception) {
-                            updateMessage = error.message ?: "检查更新失败，请稍后重试"
-                        } finally { checking = false }
-                    }
-                },
-            ) { Text(if (checking) "检查中…" else "检查更新") }
-            if (newerVersion != null) {
-                TextButton(onClick = { openGitHub(com.example.myweibo.data.WeiboReleaseUrl) }) {
-                    Text("下载更新")
-                }
+            TextButton(onClick = { openGitHub("https://github.com/Lin0u0/Weibo/tree/feature/vibo") }) {
+                Text("GitHub 主页")
             }
         }
         updateMessage?.let {

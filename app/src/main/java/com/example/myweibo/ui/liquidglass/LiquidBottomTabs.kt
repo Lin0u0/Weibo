@@ -36,6 +36,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.AbsoluteAlignment
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -50,6 +51,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastRoundToInt
@@ -133,9 +135,13 @@ fun LiquidBottomTabs(
         rememberLiquidBottomTabsGestureController(),
     feedTabIndex: Int = 0,
     onTabLongPress: (index: Int) -> Unit = {},
+    height: Dp = 64.dp,
+    dragSelectionEnabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
+    require(tabsCount > 0)
     val isLightTheme = isAppLightTheme()
+    val innerHeight = height - 8.dp
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
     val indicatorContainerColor =
@@ -150,14 +156,13 @@ fun LiquidBottomTabs(
         contentAlignment = Alignment.CenterStart,
     ) {
         val density = LocalDensity.current
-        val horizontalPaddingPx = with(density) { 4.dp.toPx() }
-        val tabWidth = with(density) {
-            (constraints.maxWidth.toFloat() - 8.dp.toPx()) / tabsCount
-        }
+        val horizontalPaddingPx = with(density) { 4.dp.roundToPx() }
+        val tabWidth = ((constraints.maxWidth - 2f * horizontalPaddingPx) / tabsCount)
+            .coerceAtLeast(1f)
         val offsetAnimation = remember { Animatable(0f) }
         val panelOffset by remember(density, constraints.maxWidth) {
             derivedStateOf {
-                val fraction = (offsetAnimation.value / constraints.maxWidth)
+                val fraction = (offsetAnimation.value / constraints.maxWidth.coerceAtLeast(1))
                     .fastCoerceIn(-1f, 1f)
                 with(density) {
                     4.dp.toPx() * fraction.sign * EaseOut.transform(abs(fraction))
@@ -167,7 +172,8 @@ fun LiquidBottomTabs(
 
         val isLtr = LocalLayoutDirection.current == LayoutDirection.Ltr
         val animationScope = rememberCoroutineScope()
-        val selectedIndex = selectedTabIndex().fastCoerceIn(0, tabsCount - 1)
+        // An external or hidden destination leaves the capsule unselected.
+        val selectedIndex = selectedTabIndex().takeIf { it in 0 until tabsCount } ?: -1
         val currentTabWidth = rememberUpdatedState(tabWidth)
         val currentIsLtr = rememberUpdatedState(isLtr)
         val currentSelectedIndex = rememberUpdatedState(selectedIndex)
@@ -194,7 +200,7 @@ fun LiquidBottomTabs(
         val dampedDragAnimation = remember(animationScope, tabsCount) {
             DampedDragAnimation(
                 animationScope = animationScope,
-                initialValue = selectedIndex.toFloat(),
+                initialValue = selectedIndex.coerceAtLeast(0).toFloat(),
                 valueRange = 0f..(tabsCount - 1).toFloat(),
                 visibilityThreshold = 0.001f,
                 initialScale = 1f,
@@ -256,7 +262,9 @@ fun LiquidBottomTabs(
         }
 
         fun cancelControlledGesture() {
-            dampedDragAnimation.animateToValue(currentSelectedIndex.value.toFloat())
+            val selected = currentSelectedIndex.value
+            if (selected >= 0) dampedDragAnimation.animateToValue(selected.toFloat())
+            else dampedDragAnimation.release()
             animationScope.launch {
                 offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
             }
@@ -303,7 +311,7 @@ fun LiquidBottomTabs(
         }
 
         LaunchedEffect(selectedIndex) {
-            if (dampedDragAnimation.targetValue.fastRoundToInt() != selectedIndex) {
+            if (selectedIndex >= 0 && dampedDragAnimation.targetValue.fastRoundToInt() != selectedIndex) {
                 dampedDragAnimation.animateToValue(selectedIndex.toFloat())
             }
         }
@@ -341,13 +349,13 @@ fun LiquidBottomTabs(
             }
         }
 
-        val interactiveHighlight = remember(animationScope, tabWidth) {
+        val interactiveHighlight = remember(animationScope, tabWidth, isLtr) {
             InteractiveHighlight(
                 animationScope = animationScope,
                 position = { size, _ ->
                     Offset(
-                        if (isLtr) (animatedIndicatorValue + 0.5f) * tabWidth + panelOffset
-                        else size.width - (animatedIndicatorValue + 0.5f) * tabWidth + panelOffset,
+                        if (isLtr) (animatedIndicatorValue + 0.5f) * tabWidth + horizontalPaddingPx + panelOffset
+                        else size.width - (animatedIndicatorValue + 0.5f) * tabWidth - horizontalPaddingPx + panelOffset,
                         size.height / 2f,
                     )
                 },
@@ -396,10 +404,11 @@ fun LiquidBottomTabs(
                     scaleY = scale
                 }
                 .drawBottomBarGlassBackdrop(backdrop, frost, glass, isLightTheme)
-                .height(64.dp)
+                .height(height)
                 .fillMaxWidth(),
         )
 
+        val showIndicator = selectedIndex >= 0 || animatedPressProgress > 0f
         CompositionLocalProvider(
             LocalLiquidBottomTabGlassMotionProgress provides glassMotionProgress,
             LocalLiquidBottomTabPressProgress provides animatedPressProgress,
@@ -407,8 +416,12 @@ fun LiquidBottomTabs(
                 val iconHalfWidth = with(density) { 11.dp.toPx() }
                 val capsuleHalfWidth = tabWidth * indicatorScaleX / 2f
                 val centerDistance = abs(index - animatedIndicatorValue) * tabWidth
-                ((capsuleHalfWidth + iconHalfWidth - centerDistance) /
-                    (2f * iconHalfWidth)).coerceIn(0f, 1f)
+                if (showIndicator) {
+                    ((capsuleHalfWidth + iconHalfWidth - centerDistance) /
+                        (2f * iconHalfWidth)).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
             },
         ) {
             Row(
@@ -421,9 +434,9 @@ fun LiquidBottomTabs(
                         scaleY = scale
                     }
                     .then(interactiveHighlight.modifier)
-                    .height(64.dp)
+                    .height(innerHeight)
                     .fillMaxWidth()
-                    .padding(4.dp),
+                    .padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 content = content,
             )
@@ -431,164 +444,172 @@ fun LiquidBottomTabs(
             // Catalog's selected lens samples a separate, tinted tab layer.
             // It is invisible and has no accessibility nodes or independent input;
             // the existing gesture controller remains the only touch owner.
-            Row(
-                Modifier
-                    .clearAndSetSemantics { }
-                    .alpha(0f)
-                    .layerBackdrop(tabsBackdrop)
-                    .graphicsLayer {
-                        translationX = panelOffset
-                        val scale = bottomBarPressScale(size.width, 16.dp.toPx(), animatedPressProgress)
-                        scaleX = scale
-                        scaleY = scale
-                    }
-                    .drawBackdrop(
-                        backdrop = backdrop,
-                        shape = { barShape },
-                        effects = {
-                            vibrancy()
-                            blur(bottomBarGlassBlurDp(frost).dp.toPx())
-                            lens(
-                                24.dp.toPx() * animatedPressProgress,
-                                24.dp.toPx() * animatedPressProgress,
-                            )
-                        },
-                        highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
-                        onDrawSurface = { drawRect(indicatorContainerColor) },
-                    )
-                    .then(interactiveHighlight.modifier)
-                    .height(56.dp)
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp)
-                    .graphicsLayer { colorFilter = ColorFilter.tint(accentColor) },
-                verticalAlignment = Alignment.CenterVertically,
-                content = content,
-            )
+            CompositionLocalProvider(LocalLiquidBottomTabIsSample provides true) {
+                Row(
+                    Modifier
+                        .clearAndSetSemantics { }
+                        .alpha(0f)
+                        .layerBackdrop(tabsBackdrop)
+                        .graphicsLayer {
+                            translationX = panelOffset
+                            val scale = bottomBarPressScale(size.width, 16.dp.toPx(), animatedPressProgress)
+                            scaleX = scale
+                            scaleY = scale
+                        }
+                        .drawBackdrop(
+                            backdrop = backdrop,
+                            shape = { barShape },
+                            effects = {
+                                vibrancy()
+                                blur(bottomBarGlassBlurDp(frost).dp.toPx())
+                                lens(
+                                    24.dp.toPx() * animatedPressProgress,
+                                    24.dp.toPx() * animatedPressProgress,
+                                )
+                            },
+                            highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
+                            onDrawSurface = { drawRect(indicatorContainerColor) },
+                        )
+                        .then(interactiveHighlight.modifier)
+                        .height(innerHeight)
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp)
+                        .graphicsLayer { colorFilter = ColorFilter.tint(accentColor) },
+                    verticalAlignment = Alignment.CenterVertically,
+                    content = content,
+                )
+            }
 
+            if (showIndicator) {
+                Box(
+                    Modifier
+                        .align(AbsoluteAlignment.CenterLeft)
+                        .padding(horizontal = 4.dp)
+                        .graphicsLayer {
+                            clip = false
+                            translationX = visualIndicatorValue * tabWidth + panelOffset
+                        }
+                        .drawBackdrop(
+                            backdrop = indicatorBackdrop,
+                            shape = { RoundedCornerShape(percent = 50) },
+                            effects = {
+                                lens(
+                                    10.dp.toPx() * animatedPressProgress,
+                                    14.dp.toPx() * animatedPressProgress,
+                                    chromaticAberration = true,
+                                )
+                            },
+                            // The backdrop must receive the same centered scaling as
+                            // the visible capsule, otherwise its sampled pixels drift.
+                            layerBlock = {
+                                transformOrigin = TransformOrigin.Center
+                                scaleX = indicatorScaleX
+                                scaleY = indicatorScaleY
+                            },
+                            highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
+                            shadow = { Shadow(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
+                            innerShadow = {
+                                val press = animatedPressProgress.coerceIn(0f, 1f)
+                                InnerShadow(radius = 8.dp * press, alpha = press)
+                            },
+                            onDrawSurface = {
+                                val press = animatedPressProgress.coerceIn(0f, 1f)
+                                val gray = if (isLightTheme) Color.Black else Color.White
+                                drawRect(if (forceDarkSurface) Color.White.copy(alpha = 0.14f * (1f - press)) else gray.copy(alpha = 0.14f * (1f - press)))
+                                drawRect(Color.Black.copy(alpha = 0.03f * press))
+                            },
+                        )
+                        .height(innerHeight)
+                        .fillMaxWidth(1f / tabsCount),
+                )
+            }
+        }
+
+        // Let the scroll container own horizontal drags when the tabs overflow.
+        if (dragSelectionEnabled) {
             Box(
                 Modifier
-                    .padding(horizontal = 4.dp)
-                    .graphicsLayer {
-                        clip = false
-                        translationX = visualIndicatorValue * tabWidth + panelOffset
-                    }
-                    .drawBackdrop(
-                        backdrop = indicatorBackdrop,
-                        shape = { RoundedCornerShape(percent = 50) },
-                        effects = {
-                            lens(
-                                10.dp.toPx() * animatedPressProgress,
-                                14.dp.toPx() * animatedPressProgress,
-                                chromaticAberration = true,
-                            )
-                        },
-                        // The backdrop must receive the same centered scaling as
-                        // the visible capsule, otherwise its sampled pixels drift.
-                        layerBlock = {
-                            transformOrigin = TransformOrigin.Center
-                            scaleX = indicatorScaleX
-                            scaleY = indicatorScaleY
-                        },
-                        highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
-                        shadow = { Shadow(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
-                        innerShadow = {
-                            val press = animatedPressProgress.coerceIn(0f, 1f)
-                            InnerShadow(radius = 8.dp * press, alpha = press)
-                        },
-                        onDrawSurface = {
-                            val press = animatedPressProgress.coerceIn(0f, 1f)
-                            val gray = if (isLightTheme) Color.Black else Color.White
-                            drawRect(if (forceDarkSurface) Color.White.copy(alpha = 0.14f * (1f - press)) else gray.copy(alpha = 0.14f * (1f - press)))
-                            drawRect(Color.Black.copy(alpha = 0.03f * press))
-                        },
-                    )
-                    .height(56.dp)
-                    .fillMaxWidth(1f / tabsCount),
-            )
+                    .fillMaxSize()
+                    .pointerInput(
+                        tabsCount,
+                        feedTabIndex,
+                        isLtr,
+                        tabWidth,
+                    ) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            down.consume()
+                            dampedDragAnimation.press()
+                            var latestPosition = down.position
+                            var releasedBeforeLongPress = false
+                            var movedBeforeLongPress = false
+                            val completedBeforeTimeout = withTimeoutOrNull(
+                                viewConfiguration.longPressTimeoutMillis,
+                            ) {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id }
+                                        ?: event.changes.firstOrNull()
+                                        ?: run {
+                                            return@withTimeoutOrNull true
+                                        }
+                                    latestPosition = change.position
+                                    if (!change.pressed) {
+                                        releasedBeforeLongPress = true
+                                        change.consume()
+                                        return@withTimeoutOrNull true
+                                    }
+                                    if ((change.position - down.position).getDistance() >
+                                        viewConfiguration.touchSlop
+                                    ) {
+                                        movedBeforeLongPress = true
+                                        return@withTimeoutOrNull true
+                                    }
+                                    change.consume()
+                                }
+                            } != null
 
-        Box(
-            Modifier
-                .fillMaxSize()
-                .pointerInput(
-                    tabsCount,
-                    feedTabIndex,
-                    isLtr,
-                    tabWidth,
-                ) {
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        down.consume()
-                        dampedDragAnimation.press()
-                        var latestPosition = down.position
-                        var releasedBeforeLongPress = false
-                        var movedBeforeLongPress = false
-                        val completedBeforeTimeout = withTimeoutOrNull(
-                            viewConfiguration.longPressTimeoutMillis,
-                        ) {
+                            if (completedBeforeTimeout) {
+                                if (releasedBeforeLongPress) {
+                                    val targetIndex = indexAt(down.position)
+                                    dampedDragAnimation.animateToValue(targetIndex.toFloat())
+                                    // A tap also activates the already-selected tab; a drag settling
+                                    // on it does not. Read the latest callback without restarting input.
+                                    currentOnTabSelected.value(targetIndex)
+                                    animationScope.launch {
+                                        offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
+                                    }
+                                    return@awaitEachGesture
+                                }
+                                if (!movedBeforeLongPress) {
+                                    dampedDragAnimation.release()
+                                    return@awaitEachGesture
+                                }
+                            }
+
+                            beginControlledGesture(
+                                position = latestPosition,
+                                showLongPressMenu = !completedBeforeTimeout,
+                            )
+                            var previousPosition = latestPosition
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val change = event.changes.firstOrNull { it.id == down.id }
                                     ?: event.changes.firstOrNull()
-                                    ?: run {
-                                        return@withTimeoutOrNull true
-                                    }
+                                    ?: break
                                 latestPosition = change.position
-                                if (!change.pressed) {
-                                    releasedBeforeLongPress = true
-                                    change.consume()
-                                    return@withTimeoutOrNull true
-                                }
-                                if ((change.position - down.position).getDistance() >
-                                    viewConfiguration.touchSlop
-                                ) {
-                                    movedBeforeLongPress = true
-                                    return@withTimeoutOrNull true
-                                }
                                 change.consume()
-                            }
-                        } != null
+                                if (!change.pressed) break
 
-                        if (completedBeforeTimeout) {
-                            if (releasedBeforeLongPress) {
-                                val targetIndex = indexAt(down.position)
-                                dampedDragAnimation.animateToValue(targetIndex.toFloat())
-                                // A tap also activates the already-selected tab; a drag settling
-                                // on it does not. Read the latest callback without restarting input.
-                                currentOnTabSelected.value(targetIndex)
-                                animationScope.launch {
-                                    offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
-                                }
-                                return@awaitEachGesture
+                                val dragAmount = latestPosition - previousPosition
+                                previousPosition = latestPosition
+                                dragControlledGesture(latestPosition, dragAmount)
                             }
-                            if (!movedBeforeLongPress) {
-                                dampedDragAnimation.release()
-                                return@awaitEachGesture
-                            }
+
+                            finishControlledGesture()
                         }
-
-                        beginControlledGesture(
-                            position = latestPosition,
-                            showLongPressMenu = !completedBeforeTimeout,
-                        )
-                        var previousPosition = latestPosition
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id }
-                                ?: event.changes.firstOrNull()
-                                ?: break
-                            latestPosition = change.position
-                            change.consume()
-                            if (!change.pressed) break
-
-                            val dragAmount = latestPosition - previousPosition
-                            previousPosition = latestPosition
-                            dragControlledGesture(latestPosition, dragAmount)
-                        }
-
-                        finishControlledGesture()
-                    }
-                },
-        )
+                    },
+            )
         }
     }
 }

@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "MyWeibo"
+rootProject.name = "Vibo"
 include(":app")

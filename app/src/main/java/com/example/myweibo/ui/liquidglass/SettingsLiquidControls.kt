@@ -140,6 +140,10 @@ internal fun SettingsLiquidSwitch(
                 }
                 didDrag = false
             },
+            onDragCancelled = {
+                didDrag = false
+                fraction = latestIndex.toFloat() / lastIndex
+            },
             onDrag = { _, amount, _ ->
                 if (latestEnabled && settlingIndex == null) {
                     didDrag = didDrag || amount.x != 0f

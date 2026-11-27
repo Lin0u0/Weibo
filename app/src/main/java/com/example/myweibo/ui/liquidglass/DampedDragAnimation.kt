@@ -26,6 +26,7 @@ class DampedDragAnimation(
     val onDragStarted: DampedDragAnimation.(position: Offset) -> Unit,
     val onDragStopped: DampedDragAnimation.() -> Unit,
     val onDrag: DampedDragAnimation.(size: IntSize, dragAmount: Offset, position: Offset) -> Unit,
+    private val onDragCancelled: (DampedDragAnimation.() -> Unit)? = null,
 ) {
 
     private val valueAnimationSpec =
@@ -55,7 +56,10 @@ class DampedDragAnimation(
     private val velocityTracker = VelocityTracker()
 
     val value: Float get() = valueAnimation.value
-    val progress: Float get() = (value - valueRange.start) / (valueRange.endInclusive - valueRange.start)
+    val progress: Float get() {
+        val range = valueRange.endInclusive - valueRange.start
+        return if (range > 0f) (value - valueRange.start) / range else 0f
+    }
     val targetValue: Float get() = valueAnimation.targetValue
     val pressProgress: Float get() = pressProgressAnimation.value
     val scaleX: Float get() = scaleXAnimation.value
@@ -63,21 +67,33 @@ class DampedDragAnimation(
     val velocity: Float get() = velocityAnimation.value
 
     val modifier: Modifier = Modifier.pointerInput(Unit) {
-        inspectDragGestures(
-            onDragStart = { down ->
-                onDragStarted(down.position)
-                press()
-            },
-            onDragEnd = {
-                onDragStopped()
-                release()
-            },
-            onDragCancel = {
-                onDragStopped()
+        var dragging = false
+        try {
+            inspectDragGestures(
+                onDragStart = { down ->
+                    dragging = true
+                    onDragStarted(down.position)
+                    press()
+                },
+                onDragEnd = {
+                    dragging = false
+                    onDragStopped()
+                    release()
+                },
+                onDragCancel = {
+                    dragging = false
+                    (onDragCancelled ?: onDragStopped).invoke(this@DampedDragAnimation)
+                    release()
+                },
+            ) { change, dragAmount ->
+                onDrag(size, dragAmount, change.position)
+            }
+        } finally {
+            // Pointer input can also be removed mid-gesture (e.g. when disabled).
+            if (dragging && onDragCancelled != null) {
+                onDragCancelled.invoke(this@DampedDragAnimation)
                 release()
             }
-        ) { change, dragAmount ->
-            onDrag(size, dragAmount, change.position)
         }
     }
 
@@ -136,11 +152,14 @@ class DampedDragAnimation(
     }
 
     private fun updateVelocity() {
+        // A single dock tab has a zero-width value range and cannot gain velocity.
+        val range = valueRange.endInclusive - valueRange.start
+        if (range == 0f) return
         velocityTracker.addPosition(
             System.currentTimeMillis(),
             Offset(value, 0f)
         )
-        val targetVelocity = velocityTracker.calculateVelocity().x / (valueRange.endInclusive - valueRange.start)
+        val targetVelocity = velocityTracker.calculateVelocity().x / range
         animationScope.launch { velocityAnimation.animateTo(targetVelocity, velocityAnimationSpec) }
     }
 }

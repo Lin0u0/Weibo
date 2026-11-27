@@ -271,6 +271,22 @@ internal fun collapseToggleWidth(): Int {
     }
 }
 
+private fun longPostToggleContrast(foreground: Color, background: Color): Float {
+    val foregroundLuminance = foreground.luminance()
+    val backgroundLuminance = background.luminance()
+    return (maxOf(foregroundLuminance, backgroundLuminance) + 0.05f) /
+        (minOf(foregroundLuminance, backgroundLuminance) + 0.05f)
+}
+
+internal fun longPostCollapseColor(accent: Color, onSurface: Color, surface: Color): Color {
+    // Keep the selected accent; only borrow enough light/dark contrast for legibility.
+    for (step in 0..20) {
+        val candidate = lerp(accent, onSurface, step / 20f)
+        if (longPostToggleContrast(candidate, surface) >= 4.5f) return candidate
+    }
+    return onSurface
+}
+
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 internal fun LongPostToggle(
@@ -285,14 +301,18 @@ internal fun LongPostToggle(
     onKeyboardFocusChanged: ((Boolean) -> Unit)? = null,
     onClick: () -> Unit,
 ) {
-    val link = MaterialTheme.colorScheme.primary
-    val linkLuminance = link.luminance()
-    val surfaceLuminance = surface.luminance()
-    val contrast = (maxOf(linkLuminance, surfaceLuminance) + 0.05f) /
-        (minOf(linkLuminance, surfaceLuminance) + 0.05f)
-    val onSurface = MaterialTheme.colorScheme.onSurface
+    val colors = MaterialTheme.colorScheme
+    val link = colors.primary
+    val onSurface = colors.onSurface
     val hasBacking = overProse?.invoke() == true
-    val color = if (!hasBacking && contrast >= 4.5f) link else onSurface
+    val capsule = lerp(surface.copy(alpha = 1f), onSurface, 0.055f)
+    val color = if (expanded) {
+        longPostCollapseColor(link, onSurface, if (hasBacking) capsule else surface)
+    } else if (!hasBacking && longPostToggleContrast(link, surface) >= 4.5f) {
+        link
+    } else {
+        onSurface
+    }
     Box(
         modifier = modifier
             .height(LongPostToggleMinSize)
@@ -307,7 +327,6 @@ internal fun LongPostToggle(
         if (overProse != null) {
             // This is a small visual pill within the unchanged 48 dp touch/placement slot.
             // Read placement in draw so the backing follows the geometry on the same frame.
-            val capsule = lerp(surface.copy(alpha = 1f), onSurface, 0.055f)
             val backing = if (backdrop != null) {
                 Modifier.drawBottomBarGlassBackdrop(
                     backdrop = backdrop,

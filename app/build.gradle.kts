@@ -21,7 +21,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.myweibo"
+        applicationId = "com.lin0u0.vibo"
         minSdk = 36
         targetSdk = 36
         versionCode = 85
@@ -42,10 +42,6 @@ android {
     }
 
     buildTypes {
-        debug {
-            // Keep instrumentation/layout checks isolated from the signed daily app.
-            applicationIdSuffix = ".layouttest"
-        }
         release {
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
