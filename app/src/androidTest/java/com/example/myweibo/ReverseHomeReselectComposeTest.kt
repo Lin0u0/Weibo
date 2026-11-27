@@ -1,5 +1,6 @@
 package com.example.myweibo
 
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.lazy.LazyListState
@@ -13,6 +14,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.SemanticsNodeInteraction
@@ -32,6 +35,8 @@ import androidx.compose.ui.test.performTouchInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myweibo.data.FeedItem
+import com.example.myweibo.data.FeedMedia
+import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.ReadingPreferences
 import com.example.myweibo.data.ReadingPreferencesStore
 import com.example.myweibo.data.TimelineCacheStore
@@ -113,6 +118,72 @@ class ReverseHomeReselectComposeTest {
             assertEquals(0, fixture.refreshes)
             assertEquals(0, fixture.pages)
         }
+    }
+
+    @Test fun openingFourFoldedPostsKeepsVisibleOldVideoAtSameScreenY() {
+        val coverPackage = InstrumentationRegistry.getInstrumentation().targetContext.packageName
+        val fixture = mount(row = { number -> fourFoldedPostsFixture(number, coverPackage) })
+        fixture.publish(newCount = 6) // Keep 30 and 29 visible; fold 28 through 25 before old head 24.
+        val folded = compose.onNodeWithText(label(R.string.feed_reverse_browse_gap, 4))
+        val expanded = compose.onNodeWithText(label(R.string.feed_reverse_browse_gap_open, 4))
+        val oldVideo = compose.onNodeWithText("Old post 24: portrait video")
+        val oldestHidden = compose.onNodeWithText("New post 25: oldest folded reply", substring = true)
+
+        fun openFromMidScreen(record: Boolean = false) {
+            fixture.positionFoldUnderPartiallyVisiblePost()
+            folded.assertIsDisplayed()
+            oldVideo.assertIsDisplayed()
+            val oldScreenY = compose.runOnIdle {
+                val layout = fixture.listState.layoutInfo
+                val projection = fixture.timeline.feedProjection
+                assertEquals(4, projection.gap?.hiddenPostCount)
+                val divider = layout.visibleItemsInfo.first { it.index == projection.dividerIndex }
+                val newer = layout.visibleItemsInfo.first { it.key == post(29).id }
+                val old = layout.visibleItemsInfo.first { it.key == post(24).id }
+                val newerTop = newer.offset + layout.beforeContentPadding
+                val dividerCenter = divider.offset + layout.beforeContentPadding + divider.size / 2
+                val viewportHeight = layout.viewportSize.height
+                assertEquals(newer.index, fixture.listState.firstVisibleItemIndex)
+                assertTrue("Newer card must straddle the viewport top", newerTop < 0 && newerTop + newer.size > 0)
+                assertTrue("Fold divider must be mid-screen", dividerCenter in viewportHeight / 3..viewportHeight * 2 / 3)
+                assertEquals(divider.index + 1, old.index)
+                assertEquals(divider.offset + divider.size, old.offset)
+                assertTrue("Fixture must use a tall old card", old.size > divider.size * 3)
+                assertTrue((25..28).none { number -> projection.visibleItems.any { it.id == post(number).id } })
+                assertTrue("Feed screen origin was not measured", fixture.feedTopOnScreen.isFinite())
+                fixture.feedTopOnScreen + layout.beforeContentPadding + old.offset
+            }
+            if (record) pauseForFoldWalkthrough()
+            folded.performTouchInput { click() }
+            oldVideo.assertIsDisplayed()
+            compose.runOnIdle {
+                assertTrue(fixture.timeline.reverseBrowseGapExpanded)
+                val layout = fixture.listState.layoutInfo
+                val old = layout.visibleItemsInfo.first { it.key == post(24).id }
+                assertEquals(
+                    "Opening the fold must not move the already-visible old video card on screen",
+                    oldScreenY, fixture.feedTopOnScreen + layout.beforeContentPadding + old.offset, 0.5f,
+                )
+                val oldest = layout.visibleItemsInfo.first { it.key == post(25).id }
+                assertEquals(old.index - 1, oldest.index)
+                assertTrue("Oldest folded card must be visible immediately above old head", oldest.offset < old.offset)
+                assertEquals(old.offset, oldest.offset + oldest.size)
+                assertEquals((30 downTo 1).map { post(it).id }, fixture.timeline.feedProjection.visibleItems.map { it.id })
+                assertEquals(0, fixture.refreshes)
+                assertEquals(0, fixture.pages)
+            }
+            oldestHidden.assertIsDisplayed()
+            if (record) pauseForFoldWalkthrough()
+        }
+
+        openFromMidScreen(record = true)
+        // With the old card pinned in place, the expanded divider can move above the viewport.
+        val expandedDividerIndex = compose.runOnIdle { requireNotNull(fixture.timeline.feedProjection.dividerIndex) }
+        fixture.scrollTo(index = expandedDividerIndex)
+        expanded.assertIsDisplayed().performTouchInput { click() }
+        folded.assertIsDisplayed()
+        compose.runOnIdle { assertFalse(fixture.timeline.reverseBrowseGapExpanded) }
+        openFromMidScreen()
     }
 
     @Test fun selectedSingleMissingAnchorDoesNotRefreshAndOtherTabOnlySwitches() {
@@ -240,8 +311,9 @@ class ReverseHomeReselectComposeTest {
         coldReopen: Boolean = false,
         withShortcut: Boolean = false,
         observe: Boolean = false,
+        row: (Int) -> FeedItem = ::post,
     ): Fixture {
-        val fixture = Fixture()
+        val fixture = Fixture(row)
         compose.setContent {
             val context = LocalContext.current
             val listState = rememberLazyListState()
@@ -259,10 +331,10 @@ class ReverseHomeReselectComposeTest {
                     timelineCacheAccountId = fixture.accountId
                     acceptReadingRows(fixture.accountId, chronological = true)
                 }
-                val rows = (24 downTo 1).map(::post)
+                val rows = (24 downTo 1).map(row)
                 val first = session(kind, rows)
                 if (seedAnchor) first.markReadingRowsViewed(requireNotNull(first.readingScope), setOf(post(24).id))
-                val home = if (coldReopen) session(kind, (36 downTo 25).map(::post)) else first
+                val home = if (coldReopen) session(kind, (36 downTo 25).map(row)) else first
                 // Keep the list keys stable across the synthetic switch, but give the other
                 // route a distinct boundary to catch accidental resume of the Home route.
                 val pinned = if (withShortcut) session(TimelineKind.FriendsCircle, rows.drop(2)).apply {
@@ -281,7 +353,7 @@ class ReverseHomeReselectComposeTest {
             }
             SideEffect { fixture.timeline = timeline; fixture.listState = listState }
             MaterialTheme {
-                Box(Modifier.fillMaxSize()) {
+                Box(Modifier.fillMaxSize().onGloballyPositioned { fixture.feedTopOnScreen = it.positionOnScreen().y }) {
                     FollowFeedScreen(
                         listState = listState,
                         homeTimeline = timeline,
@@ -339,9 +411,10 @@ class ReverseHomeReselectComposeTest {
     private fun label(resource: Int, vararg args: Any): String =
         InstrumentationRegistry.getInstrumentation().targetContext.getString(resource, *args)
 
-    private inner class Fixture {
+    private inner class Fixture(private val row: (Int) -> FeedItem) {
         lateinit var timeline: HomeTimelineReadingState
         lateinit var listState: LazyListState
+        var feedTopOnScreen = Float.NaN
         var refreshes = 0
         var pages = 0
         var menuOpens = 0
@@ -352,13 +425,30 @@ class ReverseHomeReselectComposeTest {
 
         fun publish(newCount: Int, topNoNew: Boolean = false) = compose.runOnIdle {
             timeline.publishRefresh(
-                TimelinePage((24 + newCount downTo 24).map(::post)), listState,
+                TimelinePage((24 + newCount downTo 24).map(row)), listState,
                 protectViewport = true, keepReading = true, dockRefresh = true, successfulNoNewAtTop = topNoNew,
             )
         }
 
         fun scrollTo(index: Int, offset: Int = 0) = compose.runOnIdle {
             listState.requestScrollToItem(index, offset)
+        }
+
+        fun positionFoldUnderPartiallyVisiblePost() {
+            val dividerIndex = compose.runOnIdle { requireNotNull(timeline.feedProjection.dividerIndex) }
+            scrollTo(index = dividerIndex)
+            val dividerHeight = compose.runOnIdle {
+                listState.layoutInfo.visibleItemsInfo.first { it.index == dividerIndex }.size
+            }
+            scrollTo(index = dividerIndex - 1)
+            val offset = compose.runOnIdle {
+                val layout = listState.layoutInfo
+                val newer = layout.visibleItemsInfo.first { it.index == dividerIndex - 1 }
+                // Derive the scroll amount from measured rows and viewport, not emulator density.
+                val centerOffset = newer.size + layout.beforeContentPadding + dividerHeight / 2 - layout.viewportSize.height / 2
+                centerOffset.coerceIn(layout.beforeContentPadding + 1, newer.size - 1)
+            }
+            scrollTo(index = dividerIndex - 1, offset = offset)
         }
 
         fun touchReselect(tab: SemanticsNodeInteraction) {
@@ -385,6 +475,33 @@ class ReverseHomeReselectComposeTest {
             val row = listState.layoutInfo.visibleItemsInfo.first { it.index == index }
             assertEquals(post(postNumber).id, row.key)
             assertEquals(-offset, row.offset)
+        }
+    }
+
+    private fun pauseForFoldWalkthrough() {
+        if (InstrumentationRegistry.getArguments().getString("viboFoldWalkthrough") == "true") {
+            SystemClock.sleep(1_500)
+        }
+    }
+
+    private fun fourFoldedPostsFixture(number: Int, coverPackage: String): FeedItem = post(number).let { row ->
+        fun portraitVideo(title: String) = FeedMedia(
+            type = MediaType.Video,
+            title = title,
+            coverUrl = "android.resource://$coverPackage/${R.drawable.ic_vibo_foreground}",
+            streamUrl = "file:///android_asset/live_photo_retry_fixture.mp4", // Preview only; never played.
+            durationSeconds = 12,
+            coverWidth = 360,
+            coverHeight = 640,
+        )
+        when (number) {
+            29 -> row.copy(text = "New post 29: portrait clip", medias = listOf(portraitVideo("Newer clip")))
+            28 -> row.copy(text = "New post 28: one line")
+            27 -> row.copy(text = "New post 27: two lines\nSecond line")
+            26 -> row.copy(text = "New post 26: three lines\nSecond line\nThird line")
+            25 -> row.copy(text = "New post 25: oldest folded reply\nSecond line\nThird line\nFourth line")
+            24 -> row.copy(text = "Old post 24: portrait video", medias = listOf(portraitVideo("Old clip")))
+            else -> row
         }
     }
 

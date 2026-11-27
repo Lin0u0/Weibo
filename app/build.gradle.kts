@@ -27,8 +27,8 @@ android {
         // Bump both values in source for each delivered APK, not for CI retries.
         // Use YYYY.MM.DD.N (N starts at 1 each day) and a versionCode higher than
         // the last distributed APK. Never move the release date backward.
-        versionCode = 86
-        versionName = "2026.11.27.1"
+        versionCode = 87
+        versionName = "2026.11.27.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

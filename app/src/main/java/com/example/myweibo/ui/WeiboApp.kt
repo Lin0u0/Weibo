@@ -4403,7 +4403,8 @@ internal class HomeTimelineReadingState(
     }
 
     fun toggleTimelineGap(listState: LazyListState) {
-        if (feedProjection.gap == null) return
+        val projection = feedProjection
+        val gap = projection.gap ?: return
         if (reverseBrowseGapExpanded) {
             pendingGapExpansionAnchor = null
             protectedNewPostFloor = 0
@@ -4411,13 +4412,17 @@ internal class HomeTimelineReadingState(
             listState.retainHomeViewportIfKeyRemoved(feedProjection)
             return
         }
-        // Keeping the divider key would put the newly opened posts below the viewport
-        // anchor. Keep the first visible post (usually R) at the same offset instead.
-        val firstIndex = listState.firstVisibleItemIndex
-        val row = listState.layoutInfo.visibleItemsInfo.firstOrNull {
-            it.index >= firstIndex && it.key != FeedReverseBrowseGapKey
+        // Unfold above the old head, even when a newer post is still visible above the divider.
+        // Anchoring that newer post (or the divider) would push the old head down instead.
+        val oldHead = projection.visibleItems.getOrNull(gap.insertionIndex)
+        val visibleRows = listState.layoutInfo.visibleItemsInfo
+        pendingGapExpansionAnchor = oldHead?.let { post ->
+            val offset = visibleRows.firstOrNull { it.key == post.id }?.offset
+                // The divider can be tapped even if the next row hasn't entered the viewport.
+                ?: visibleRows.firstOrNull { it.index == gap.insertionIndex && it.key == FeedReverseBrowseGapKey }
+                    ?.let { it.offset + it.size }
+            offset?.let { post.id to it }
         }
-        pendingGapExpansionAnchor = row?.let { item -> (item.key as? String)?.let { it to item.offset } }
         reverseBrowseGapExpanded = true
     }
 
@@ -4426,12 +4431,9 @@ internal class HomeTimelineReadingState(
         pendingGapExpansionAnchor = null
         val postIndex = projection.visibleItems.indexOfFirst { it.id == key }
         if (postIndex < 0) return
-        val target = projection.lazyIndexOfPost(postIndex)
-        val firstIndex = listState.firstVisibleItemIndex
-        val firstRow = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }
-        if (target != firstIndex || firstRow == null || firstRow.key != key || firstRow.offset != offset) {
-            listState.requestScrollToItem(target, -offset)
-        }
+        // A positive layout offset places the old head below the padded content start.
+        // The signed scroll offset lets Compose lay out as many preceding rows as needed.
+        listState.requestScrollToItem(projection.lazyIndexOfPost(postIndex), -offset)
     }
 
     fun currentVerifiedTimelineAccount(accountStore: WeiboAccountStore, requestedAccountId: String?): String? =
