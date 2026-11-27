@@ -1,6 +1,7 @@
 package com.example.myweibo.ui
 
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Icon
@@ -23,7 +27,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -34,6 +42,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -41,17 +50,18 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import com.example.myweibo.R
 import com.example.myweibo.data.TimelineKind
-import com.example.myweibo.data.ViboDockItem
+import com.example.myweibo.data.ViboDockEntry
 import com.example.myweibo.data.ViboDockPreferences
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
@@ -67,6 +77,14 @@ private val DockGap = 8.dp
 private val DockTabMinWidth = 48.dp
 private val DockCapsulePadding = 4.dp
 
+/** Optional account/timeline data; main tabs still use the bar’s onTabChange callback. */
+internal data class ViboDockRuntime(
+    val catalogue: List<ViboDockEntry>,
+    val selectedEntryId: String? = null,
+    val onEntrySelected: (ViboDockEntry) -> Unit,
+    val profileAvatarUrl: String?,
+)
+
 @Composable
 internal fun WeiboLiquidBottomBar(
     selectedTab: MainTab,
@@ -79,7 +97,6 @@ internal fun WeiboLiquidBottomBar(
     onTimelineMenuExpandedChange: (Boolean) -> Unit,
     selectedTimelineKind: TimelineKind = TimelineKind.Following,
     selectedTimelineLabel: String? = null,
-    onTimelineKindChange: (TimelineKind) -> Unit = {},
     timelineMenuContent: @Composable (dismiss: () -> Unit) -> Unit,
     timelineMenuWidth: Dp = 152.dp,
     timelineMenuHeight: Dp = 89.dp,
@@ -89,13 +106,33 @@ internal fun WeiboLiquidBottomBar(
     dockPreferences: ViboDockPreferences = ViboDockPreferences(),
     unreadMessagesCount: Int = 0,
     applyNavigationBarInsets: Boolean = true,
+    dockRuntime: ViboDockRuntime? = null,
 ) {
-    val tabs = dockPreferences.visibleItems.distinct().map(ViboDockItem::toMainTab)
-    val feedIndex = tabs.indexOf(MainTab.Feed)
-    val timelineLabel = selectedTimelineLabel ?: selectedTimelineKind.label
+    val catalogue = dockRuntime?.catalogue.orEmpty()
+    val entries = remember(dockPreferences, catalogue) { dockPreferences.orderedVisibleEntries(catalogue) }
+    val entryIds = remember(entries) { entries.map(ViboDockEntry::id) }
+    val homeIndex = entryIds.indexOf(ViboDockEntry.Home.id)
+    val firstTimelineIndex = entries.indexOfFirst(ViboDockEntry::isTimelineSlot)
+    val visibleTimelineIndex = dockRuntime?.selectedEntryId?.let(entryIds::indexOf)
+        ?.takeIf { it >= 0 && entries[it].isTimelineShortcut() }
+    val selectedIndex = when (selectedTab) {
+        // Home represents unpinned routes only when it is actually visible.
+        MainTab.Feed -> visibleTimelineIndex ?: homeIndex
+        MainTab.Messages -> entryIds.indexOf(ViboDockEntry.Messages.id)
+        MainTab.Compose -> entryIds.indexOf(ViboDockEntry.Compose.id)
+        MainTab.Search, MainTab.Mine -> -1
+    }
+    val homeLabel = if (visibleTimelineIndex == null) {
+        selectedTimelineLabel ?: selectedTimelineKind.label
+    } else ViboDockEntry.Home.title
 
-    LaunchedEffect(feedIndex, timelineMenuExpanded) {
-        if (feedIndex < 0 && timelineMenuExpanded) onTimelineMenuExpandedChange(false)
+    var menuAnchorEntryId by remember { mutableStateOf<String?>(null) }
+    val menuAnchorIndex = menuAnchorEntryId?.let(entryIds::indexOf)?.takeIf { it >= 0 }
+        ?: homeIndex.takeIf { it >= 0 }
+        ?: visibleTimelineIndex?.takeIf { selectedTab == MainTab.Feed }
+        ?: firstTimelineIndex
+    LaunchedEffect(menuAnchorIndex, timelineMenuExpanded) {
+        if (menuAnchorIndex < 0 && timelineMenuExpanded) onTimelineMenuExpandedChange(false)
     }
 
     BoxWithConstraints(
@@ -107,29 +144,62 @@ internal fun WeiboLiquidBottomBar(
     ) {
         val density = LocalDensity.current
         val dockWidth = maxWidth
-        val searchSize = DockHeight.coerceAtMost(dockWidth)
-        val gap = DockGap.coerceAtMost((dockWidth - searchSize).coerceAtLeast(0.dp))
-        val availableCapsuleWidth = (dockWidth - searchSize - gap).coerceAtLeast(0.dp)
+        val endcapSize = DockHeight.coerceAtMost(dockWidth / 2f)
+        val middleWidth = (dockWidth - endcapSize * 2).coerceAtLeast(0.dp)
+        val gap = if (entries.isNotEmpty() && middleWidth > DockGap * 2) DockGap else 0.dp
+        val availableCapsuleWidth = (middleWidth - gap * 2).coerceAtLeast(0.dp)
         val minimumCapsuleWidth = with(density) {
-            (DockTabMinWidth.roundToPx() * tabs.size + DockCapsulePadding.roundToPx() * 2).toDp()
+            (DockTabMinWidth.roundToPx() * entries.size + DockCapsulePadding.roundToPx() * 2).toDp()
         }
         val capsuleWidth = maxOf(minimumCapsuleWidth, availableCapsuleWidth)
         val scrollable = capsuleWidth > availableCapsuleWidth
         val capsuleScroll = rememberScrollState()
+        val insetPx = with(density) { DockCapsulePadding.roundToPx() }
+        val capsuleWidthPx = with(density) { capsuleWidth.roundToPx() }
+        val viewportWidthPx = with(density) { availableCapsuleWidth.roundToPx() }
+        val entryWidthPx = (capsuleWidthPx - 2f * insetPx) / entries.size.coerceAtLeast(1)
+
+        // A change from the Home picker can select a shortcut that is offscreen. Reveal it
+        // with the smallest movement, but don't fight swipes while the selection is unchanged.
+        LaunchedEffect(entryIds, selectedIndex, viewportWidthPx, capsuleWidthPx) {
+            if (!scrollable || selectedIndex < 0 || viewportWidthPx <= 0) return@LaunchedEffect
+            val start = (insetPx + entryWidthPx * selectedIndex).roundToInt()
+            val end = (insetPx + entryWidthPx * (selectedIndex + 1)).roundToInt()
+            val current = capsuleScroll.value.coerceAtMost((capsuleWidthPx - viewportWidthPx).coerceAtLeast(0))
+            val target = when {
+                start < current -> start
+                end > current + viewportWidthPx -> end - viewportWidthPx
+                else -> current
+            }
+            if (target != capsuleScroll.value) capsuleScroll.scrollTo(target)
+        }
 
         ViboDock(
-            tabs = tabs,
+            entries = entries,
+            entryIds = entryIds,
             selectedTab = selectedTab,
-            timelineLabel = timelineLabel,
-            onTabChange = { tab ->
-                if (tab != MainTab.Feed) onTimelineMenuExpandedChange(false)
+            selectedIndex = selectedIndex,
+            homeLabel = homeLabel,
+            onEntrySelected = { entry ->
+                if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
+                if (dockRuntime != null && entry.isTimelineShortcut()) {
+                    dockRuntime.onEntrySelected(entry)
+                } else {
+                    onTabChange(entry.toMainTab())
+                }
+            },
+            onEndcapSelected = { tab ->
+                onTimelineMenuExpandedChange(false)
                 onTabChange(tab)
             },
-            onHomeLongPress = { onTimelineMenuExpandedChange(true) },
+            onTimelineLongPress = { entry ->
+                menuAnchorEntryId = entry.id
+                onTimelineMenuExpandedChange(true)
+            },
             showLabels = dockPreferences.showLabels,
             unreadMessagesCount = unreadMessagesCount,
-            searchSize = searchSize,
-            capsuleGap = gap,
+            profileAvatarUrl = dockRuntime?.profileAvatarUrl,
+            endcapSize = endcapSize,
             availableCapsuleWidth = availableCapsuleWidth,
             capsuleWidth = capsuleWidth,
             capsuleScroll = capsuleScroll,
@@ -137,32 +207,32 @@ internal fun WeiboLiquidBottomBar(
             frostAmount = frostAmount,
             glassAmount = glassAmount,
             darkSurfaceOverride = darkSurfaceOverride,
-            modifier = Modifier.onGloballyPositioned { onBarBoundsChanged?.invoke(it.boundsInRoot()) },
+            modifier = Modifier.fillMaxWidth().onGloballyPositioned { onBarBoundsChanged?.invoke(it.boundsInRoot()) },
         )
 
         val menuWidth = timelineMenuWidth.coerceAtMost(dockWidth)
-        val homeCenterInDock = with(density) {
-            val inset = DockCapsulePadding.roundToPx()
-            val itemWidth = (capsuleWidth.roundToPx() - 2f * inset) / tabs.size.coerceAtLeast(1)
+        val menuAnchorCenterInDock = with(density) {
             val scrollOffset = if (scrollable) capsuleScroll.value else 0
-            searchSize.roundToPx() + gap.roundToPx() + inset + itemWidth * (feedIndex + 0.5f) - scrollOffset
+            val anchorCenterInViewport = insetPx + entryWidthPx * (menuAnchorIndex + 0.5f) - scrollOffset
+            endcapSize.roundToPx() + gap.roundToPx() + anchorCenterInViewport.coerceIn(0f, viewportWidthPx.toFloat())
         }
         val timelineMenuOffsetX = with(density) {
-            (homeCenterInDock - menuWidth.toPx() / 2f)
+            (menuAnchorCenterInDock - menuWidth.toPx() / 2f)
                 .roundToInt()
                 .coerceIn(0, (dockWidth - menuWidth).roundToPx().coerceAtLeast(0))
         }
         val layoutDirection = LocalLayoutDirection.current
         val timelineMenuOrigin = with(density) {
-            val startRelativeX = homeCenterInDock - timelineMenuOffsetX
+            val startRelativeX = menuAnchorCenterInDock - timelineMenuOffsetX
             val physicalX = if (layoutDirection == LayoutDirection.Ltr) startRelativeX else menuWidth.toPx() - startRelativeX
             Offset(physicalX, timelineMenuHeight.toPx())
         }
         ActionMenuReveal(
-            visible = timelineMenuExpanded && feedIndex >= 0 && availableCapsuleWidth > 0.dp,
+            visible = timelineMenuExpanded && menuAnchorIndex >= 0 && availableCapsuleWidth > 0.dp,
             menuWidth = menuWidth,
             menuHeight = timelineMenuHeight,
             originInMenu = timelineMenuOrigin,
+            onExitComplete = { menuAnchorEntryId = null },
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .offset { IntOffset(timelineMenuOffsetX, -(DockHeight + timelineMenuGap).roundToPx()) }
@@ -176,15 +246,18 @@ internal fun WeiboLiquidBottomBar(
 
 @Composable
 private fun ViboDock(
-    tabs: List<MainTab>,
+    entries: List<ViboDockEntry>,
+    entryIds: List<String>,
     selectedTab: MainTab,
-    timelineLabel: String,
-    onTabChange: (MainTab) -> Unit,
-    onHomeLongPress: () -> Unit,
+    selectedIndex: Int,
+    homeLabel: String,
+    onEntrySelected: (ViboDockEntry) -> Unit,
+    onEndcapSelected: (MainTab) -> Unit,
+    onTimelineLongPress: (ViboDockEntry) -> Unit,
     showLabels: Boolean,
     unreadMessagesCount: Int,
-    searchSize: Dp,
-    capsuleGap: Dp,
+    profileAvatarUrl: String?,
+    endcapSize: Dp,
     availableCapsuleWidth: Dp,
     capsuleWidth: Dp,
     capsuleScroll: ScrollState,
@@ -196,62 +269,61 @@ private fun ViboDock(
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
     val contentColor = if (isAppLightTheme() && !darkSurfaceOverride) Color.Black else Color(0xFFD0D0D0)
-    val selectedIndex = tabs.indexOf(selectedTab)
-    val feedIndex = tabs.indexOf(MainTab.Feed)
     val scrollable = capsuleWidth > availableCapsuleWidth
 
     Row(
         modifier = modifier.height(DockHeight).selectableGroup(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(capsuleGap),
+        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         LiquidDockSearchButton(
             selected = selectedTab == MainTab.Search,
-            onClick = { onTabChange(MainTab.Search) },
+            onClick = { onEndcapSelected(MainTab.Search) },
             backdrop = backdrop,
             frostAmount = frostAmount,
             glassAmount = glassAmount,
             forceDarkSurface = darkSurfaceOverride,
-            modifier = Modifier.size(searchSize).semantics { contentDescription = MainTab.Search.label },
+            modifier = Modifier.size(endcapSize).semantics { contentDescription = MainTab.Search.label },
         ) {
-            WeiboTabIcon(MainTab.Search, contentColor)
+            ViboDockEntryGlyph(ViboDockEntry.Search, contentColor)
         }
 
-        if (tabs.isNotEmpty() && availableCapsuleWidth > 0.dp) {
+        if (entries.isNotEmpty() && availableCapsuleWidth > 0.dp) {
             Box(
                 Modifier.width(availableCapsuleWidth)
+                    .testTag("vibo_dock_capsule")
                     .then(if (scrollable) Modifier.horizontalScroll(capsuleScroll) else Modifier),
             ) {
                 // Cancel positional gestures if the user changes the item order while touching.
-                key(tabs) {
+                key(entryIds) {
                     LiquidBottomTabs(
                         selectedTabIndex = { selectedIndex },
-                        onTabSelected = { index -> onTabChange(tabs[index]) },
+                        onTabSelected = { index -> onEntrySelected(entries[index]) },
                         backdrop = backdrop,
                         accentColor = accentColor,
                         frostAmount = frostAmount,
                         glassAmount = glassAmount,
                         forceDarkSurface = darkSurfaceOverride,
-                        tabsCount = tabs.size,
-                        feedTabIndex = feedIndex,
-                        onTabLongPress = { onHomeLongPress() },
+                        tabsCount = entries.size,
+                        isTabLongPressEnabled = { entries[it].isTimelineSlot() },
+                        onTabLongPress = { onTimelineLongPress(entries[it]) },
                         height = DockHeight,
                         dragSelectionEnabled = !scrollable,
                         modifier = Modifier.width(capsuleWidth),
                     ) {
                         val tabCoverage = LocalLiquidBottomTabCoverage.current
                         val pressProgress = LocalLiquidBottomTabPressProgress.current
-                        tabs.forEachIndexed { index, tab ->
+                        entries.forEachIndexed { index, entry ->
                             val coverage = tabCoverage(index)
-                            val isHome = tab == MainTab.Feed
-                            val unread = if (tab == MainTab.Messages) unreadMessagesCount else 0
+                            val isHome = entry.id == ViboDockEntry.Home.id
+                            val unread = if (entry.id == ViboDockEntry.Messages.id) unreadMessagesCount else 0
                             LiquidBottomTab(
                                 selected = index == selectedIndex,
-                                onClick = { onTabChange(tab) },
-                                onLongClick = if (isHome) onHomeLongPress else null,
+                                onClick = { onEntrySelected(entry) },
+                                onLongClick = if (entry.isTimelineSlot()) ({ onTimelineLongPress(entry) }) else null,
                                 modifier = Modifier.semantics {
-                                    contentDescription = tab.label
-                                    if (isHome && timelineLabel != tab.label) stateDescription = timelineLabel
+                                    contentDescription = entry.title
+                                    if (isHome && homeLabel != entry.title) stateDescription = homeLabel
                                     if (unread > 0) stateDescription = "$unread 条未读消息"
                                 },
                             ) {
@@ -271,16 +343,16 @@ private fun ViboDock(
                                                 Text(if (unread > 99) "99+" else unread.toString())
                                             }
                                         }) {
-                                            WeiboTabIcon(tab, contentColor)
+                                            ViboDockEntryGlyph(entry, contentColor)
                                         }
                                     } else {
-                                        WeiboTabIcon(tab, contentColor)
+                                        ViboDockEntryGlyph(entry, contentColor)
                                     }
                                 }
                                 if (showLabels) {
                                     DockLabel(
-                                        label = if (isHome) timelineLabel else tab.label,
-                                        fallback = if (isHome) tab.label else null,
+                                        label = if (isHome) homeLabel else entry.title,
+                                        fallback = if (isHome) entry.title else null,
                                         color = contentColor,
                                         emphasized = coverage > 0.5f,
                                     )
@@ -290,6 +362,18 @@ private fun ViboDock(
                     }
                 }
             }
+        }
+
+        LiquidDockSearchButton(
+            selected = selectedTab == MainTab.Mine,
+            onClick = { onEndcapSelected(MainTab.Mine) },
+            backdrop = backdrop,
+            frostAmount = frostAmount,
+            glassAmount = glassAmount,
+            forceDarkSurface = darkSurfaceOverride,
+            modifier = Modifier.size(endcapSize).semantics { contentDescription = MainTab.Mine.label },
+        ) {
+            ViboDockAvatar(profileAvatarUrl, contentColor, selected = selectedTab == MainTab.Mine)
         }
     }
 }
@@ -322,27 +406,56 @@ private fun DockLabel(label: String, fallback: String?, color: Color, emphasized
     }
 }
 
-private fun ViboDockItem.toMainTab(): MainTab = when (this) {
-    ViboDockItem.HOME -> MainTab.Feed
-    ViboDockItem.MESSAGES -> MainTab.Messages
-    ViboDockItem.COMPOSE -> MainTab.Compose
-    ViboDockItem.PROFILE -> MainTab.Mine
+private fun ViboDockEntry.toMainTab(): MainTab = when (id) {
+    ViboDockEntry.Messages.id -> MainTab.Messages
+    ViboDockEntry.Compose.id -> MainTab.Compose
+    else -> MainTab.Feed
 }
 
+private fun ViboDockEntry.isTimelineShortcut(): Boolean = timelineKind != null || group != null
+
+private fun ViboDockEntry.isTimelineSlot(): Boolean = id == ViboDockEntry.Home.id || isTimelineShortcut()
+
 @Composable
-private fun WeiboTabIcon(tab: MainTab, color: Color) {
-    Icon(
-        painter = painterResource(
-            when (tab) {
-                MainTab.Feed -> R.drawable.ic_tab_home
-                MainTab.Search -> R.drawable.ic_tab_search
-                MainTab.Messages -> R.drawable.ic_tab_messages
-                MainTab.Mine -> R.drawable.ic_tab_mine
-                MainTab.Compose -> R.drawable.ic_tab_compose
-            },
-        ),
-        contentDescription = null,
-        modifier = Modifier.size(22.dp),
-        tint = color,
-    )
+internal fun ViboDockEntryGlyph(
+    entry: ViboDockEntry,
+    color: Color,
+    size: Dp = 22.dp,
+    contentDescription: String? = null,
+) {
+    val badge = entry.groupBadge
+    if (badge.isNullOrBlank()) {
+        Icon(
+            painter = painterResource(entry.iconRes),
+            contentDescription = contentDescription,
+            modifier = Modifier.size(size),
+            tint = color,
+        )
+        return
+    }
+
+    val glyphDescription = contentDescription
+    Box(
+        modifier = Modifier.size(size)
+            .border(1.dp, color, RoundedCornerShape(6.dp))
+            .clearAndSetSemantics {
+                if (glyphDescription != null) this.contentDescription = glyphDescription
+            }
+            .padding(horizontal = 2.dp, vertical = 1.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        BasicText(
+            text = badge,
+            style = LocalTextStyle.current.copy(
+                color = color,
+                textAlign = TextAlign.Center,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp,
+                lineHeight = TextUnit.Unspecified,
+            ),
+            maxLines = 1,
+            softWrap = false,
+            autoSize = TextAutoSize.StepBased(minFontSize = 6.sp, maxFontSize = 13.sp, stepSize = 0.5.sp),
+        )
+    }
 }

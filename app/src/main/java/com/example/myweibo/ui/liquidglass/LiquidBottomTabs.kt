@@ -137,6 +137,7 @@ fun LiquidBottomTabs(
     onTabLongPress: (index: Int) -> Unit = {},
     height: Dp = 64.dp,
     dragSelectionEnabled: Boolean = true,
+    isTabLongPressEnabled: ((index: Int) -> Boolean)? = null,
     content: @Composable RowScope.() -> Unit,
 ) {
     require(tabsCount > 0)
@@ -177,7 +178,7 @@ fun LiquidBottomTabs(
         val currentTabWidth = rememberUpdatedState(tabWidth)
         val currentIsLtr = rememberUpdatedState(isLtr)
         val currentSelectedIndex = rememberUpdatedState(selectedIndex)
-        val currentFeedTabIndex = rememberUpdatedState(feedTabIndex)
+        val currentIsTabLongPressEnabled = rememberUpdatedState(isTabLongPressEnabled ?: { index: Int -> index == feedTabIndex })
         val currentMaxWidth = rememberUpdatedState(constraints.maxWidth)
         val currentMaxHeight = rememberUpdatedState(constraints.maxHeight)
         val currentOnTabSelected = rememberUpdatedState(onTabSelected)
@@ -234,12 +235,13 @@ fun LiquidBottomTabs(
         }
         var controlledGesturePosition by remember { mutableStateOf(Offset.Zero) }
 
-        fun beginControlledGesture(position: Offset, showLongPressMenu: Boolean) {
+        fun beginControlledGesture(position: Offset, showLongPressMenu: Boolean): Boolean {
             controlledGesturePosition = position
-            if (showLongPressMenu && indexAt(position) == currentFeedTabIndex.value) {
-                currentOnTabLongPress.value(currentFeedTabIndex.value)
-            }
+            val index = indexAt(position)
+            val openedMenu = showLongPressMenu && currentIsTabLongPressEnabled.value(index)
+            if (openedMenu) currentOnTabLongPress.value(index)
             dampedDragAnimation.updateValue(valueAt(position))
+            return openedMenu
         }
 
         fun dragControlledGesture(position: Offset, dragAmount: Offset) {
@@ -587,10 +589,12 @@ fun LiquidBottomTabs(
                                 }
                             }
 
-                            beginControlledGesture(
+                            val openedMenu = beginControlledGesture(
                                 position = latestPosition,
                                 showLongPressMenu = !completedBeforeTimeout,
                             )
+                            val longPressPosition = latestPosition
+                            var draggedAfterLongPress = false
                             var previousPosition = latestPosition
                             while (true) {
                                 val event = awaitPointerEvent()
@@ -603,10 +607,17 @@ fun LiquidBottomTabs(
 
                                 val dragAmount = latestPosition - previousPosition
                                 previousPosition = latestPosition
+                                draggedAfterLongPress = draggedAfterLongPress ||
+                                    (latestPosition - longPressPosition).getDistance() > viewConfiguration.touchSlop
                                 dragControlledGesture(latestPosition, dragAmount)
                             }
 
-                            finishControlledGesture()
+                            // Holding an unselected tab opens its menu without selecting the tab on release.
+                            if (openedMenu && !draggedAfterLongPress) {
+                                cancelControlledGesture()
+                            } else {
+                                finishControlledGesture()
+                            }
                         }
                     },
             )
