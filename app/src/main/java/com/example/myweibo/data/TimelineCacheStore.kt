@@ -68,6 +68,46 @@ class TimelineCacheStore(context: Context) {
         }
     }
 
+    /** Keep the confirmed refresh prefix available on a cold open without changing the tail cursor. */
+    internal suspend fun mergeFollowingRefresh(
+        accountId: String,
+        rawJson: String,
+        retainedRows: List<FeedItem>,
+        tailCursor: String?,
+    ): Set<String>? = withContext(Dispatchers.IO) {
+        cacheMutex.withLock {
+            runCatching {
+                val file = cacheFile(accountId)
+                val byRow = mutableMapOf<String, JSONObject>()
+                val byStatus = mutableMapOf<String, JSONObject>()
+                fun index(root: JSONObject) {
+                    val entries = root.optJSONArray("statuses")
+                        ?: root.optJSONObject("data")?.optJSONArray("statuses")
+                        ?: root.optJSONObject("data")?.optJSONArray("list")
+                        ?: root.optJSONArray("list") ?: return
+                    for (i in 0 until entries.length()) {
+                        val entry = entries.optJSONObject(i) ?: continue
+                        val post = entry.optJSONObject("mblog") ?: entry
+                        val rowId = post.optString("idstr").ifBlank { post.optString("mid") }.ifBlank { post.optString("id") }
+                        if (rowId.isNotBlank()) byRow[rowId] = post
+                        val statusId = post.optString("mblogid")
+                        if (statusId.isNotBlank()) byStatus[statusId] = post
+                    }
+                }
+                if (file.exists()) index(JSONObject(file.readText(Charsets.UTF_8)))
+                index(JSONObject(rawJson))
+                val statuses = JSONArray()
+                for (row in retainedRows) {
+                    val post = byRow[row.id] ?: byStatus[row.statusId] ?: continue
+                    // Keep the live stable row ID for cold scroll anchors, even when the
+                    // response used a different alias for the same status.
+                    statuses.put(JSONObject(post.toString()).put("idstr", row.id))
+                }
+                writeCacheAtomically(file, JSONObject().put("statuses", statuses).put("max_id", tailCursor).toString())
+            }.getOrNull()
+        }
+    }
+
     // Return the IDs the same parser can actually restore, only after the atomic rename succeeds.
     private fun writeCacheAtomically(cacheFile: File, rawJson: String): Set<String> {
         val ids = WeiboJsonParser.parseTimeline(rawJson).items.mapTo(HashSet()) { it.id }

@@ -4,7 +4,9 @@ import com.example.myweibo.data.FeedItem
 import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.data.TimelineReadingAnchor
 import com.example.myweibo.data.TimelineReadingScope
+import com.example.myweibo.data.TimelineRefreshReadingBatch
 import com.example.myweibo.data.advanceTimelineReadingAnchor
+import com.example.myweibo.data.classifyExplicitTimelineRefresh
 import com.example.myweibo.data.countNewTimelinePosts
 import com.example.myweibo.data.hasChronologicalResponse
 import com.example.myweibo.data.isTimelineRowMeaningfullyVisible
@@ -82,6 +84,58 @@ class TimelineReadingBoundaryTest {
         assertNull(countNewTimelinePosts(previous, listOf(undated), ordered = true))
         assertEquals(1, countNewTimelinePosts(previous, listOf(tied, head), ordered = true))
         assertEquals(0, countNewTimelinePosts(previous, listOf(head, undated), ordered = true))
+    }
+
+    @Test fun explicitRefreshUsesThePreRequestHeadNotTheReadFrontier() {
+        // Newest first: old B/A/R, then fetch new D/C followed by B. A/B are not in the new batch.
+        val previous = listOf(post(6), post(5), post(4), post(2))
+        val oldHeadAlias = post(6).copy(id = "response-alias-for-B")
+        val newHead = post(8)
+        val pin = post(90).copy(isPinned = true)
+        val response = listOf(pin, newHead, newHead.copy(id = "response-alias-for-D"), post(7), oldHeadAlias, post(5))
+        assertEquals(
+            TimelineRefreshReadingBatch(baseline = anchor(6), remaining = listOf(anchor(8), anchor(7))),
+            classifyExplicitTimelineRefresh(previous, response),
+        )
+        assertEquals(
+            TimelineRefreshReadingBatch(baseline = anchor(6), remaining = emptyList()),
+            classifyExplicitTimelineRefresh(previous, listOf(pin, oldHeadAlias, post(5), post(3), post(2))),
+        )
+    }
+
+    @Test fun outOfOrderDisjointAndOlderPagesCannotConfirmAnExplicitBatch() {
+        val previous = listOf(post(6), post(5), post(4), post(2))
+        val cases = mapOf(
+            "empty" to emptyList(),
+            "pins only" to listOf(post(90).copy(isPinned = true)),
+            "newer but disjoint" to listOf(post(8), post(7)),
+            "deeper overlap without previous head" to listOf(post(8), post(5)),
+            "reordered known rows" to listOf(post(6), post(4), post(5)),
+            "unfamiliar newer row out of order" to listOf(post(6), post(7), post(5)),
+            "older pagination page" to listOf(post(4), post(2), post(1)),
+        )
+        cases.forEach { (scenario, page) ->
+            assertNull(scenario, classifyExplicitTimelineRefresh(previous, page))
+        }
+    }
+
+    @Test fun incompleteSeamCannotConfirmZeroAfterDisjointRowsWereMerged() {
+        val previous = listOf(post(8), post(7), post(6), post(5), post(4))
+        val unresolvedSeam = listOf(anchor(7) to anchor(6))
+        assertNull(classifyExplicitTimelineRefresh(previous, previous.take(2), requiredSeams = unresolvedSeam))
+        assertEquals(
+            TimelineRefreshReadingBatch(baseline = anchor(8), remaining = emptyList()),
+            classifyExplicitTimelineRefresh(previous, previous.take(3), requiredSeams = unresolvedSeam),
+        )
+    }
+
+    @Test fun explicitBatchAdvancesOnlyAcrossQualifiedAdjacentMembers() {
+        val batch = TimelineRefreshReadingBatch(baseline = anchor(6), remaining = listOf(anchor(8), anchor(7)))
+        val rows = (8 downTo 4).map(::post)
+        assertEquals(batch, batch.afterViewing(rows, setOf(post(8).id, post(6).id, post(5).id)))
+        val afterC = batch.afterViewing(rows, setOf(post(7).id))
+        assertEquals(batch.copy(remaining = listOf(anchor(8)), viewedThrough = anchor(7)), afterC)
+        assertEquals(batch.copy(remaining = emptyList(), viewedThrough = anchor(8)), afterC.afterViewing(rows, setOf(post(8).id)))
     }
 
     @Test fun exposedRowUsesUsableViewportForTallAndClippedRows() {

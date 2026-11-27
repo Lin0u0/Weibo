@@ -135,6 +135,7 @@ fun projectFeedTimelineRefresh(
     previousHeadId: String?,
     maxVisibleNewPosts: Int,
     gapExpanded: Boolean = false,
+    unreadRowIds: Set<String>? = null,
 ): FeedTimelineRefreshProjection {
     val boundary = items.indexOfFirst { it.id == previousHeadId }
     if (boundary < 0 || items[boundary].isPinned) return FeedTimelineRefreshProjection(items, gap = null)
@@ -144,7 +145,7 @@ fun projectFeedTimelineRefresh(
     var newCount = 0
     var firstHiddenIndex = -1
     val visiblePrefix = items.subList(0, boundary).filterIndexed { index, item ->
-        if (item.isPinned) return@filterIndexed true
+        if (item.isPinned || unreadRowIds?.contains(item.id) == false) return@filterIndexed true
         val key = feedItemSortKey(item)
         if (key != 0L && boundaryKey != 0L && key < boundaryKey) return@filterIndexed true
         if (++newCount <= limit) return@filterIndexed true

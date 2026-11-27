@@ -119,3 +119,84 @@ internal fun countNewTimelinePosts(previous: List<FeedItem>, page: List<FeedItem
     }
     return count
 }
+
+/** The local disposition and qualified progress of the last committed explicit refresh.
+ * An empty [remaining] list is meaningful: do not fall back to the old read frontier. */
+internal data class TimelineRefreshReadingBatch(
+    val baseline: TimelineReadingAnchor,
+    val remaining: List<TimelineReadingAnchor>,
+    val viewedThrough: TimelineReadingAnchor? = null,
+    val forceProjection: Boolean = false,
+) {
+    fun afterViewing(items: List<FeedItem>, qualified: Set<String>): TimelineRefreshReadingBatch {
+        var size = remaining.size
+        while (size > 0 && items.any { it.id in qualified && remaining[size - 1].matches(it) }) size--
+        return if (size == remaining.size) this else copy(
+            remaining = remaining.take(size), viewedThrough = remaining[size],
+        )
+    }
+}
+
+/** A first page must actually reconnect to the request-time head; dates do not bridge a gap. */
+internal fun classifyExplicitTimelineRefresh(
+    previous: List<FeedItem>,
+    page: List<FeedItem>,
+    requiredSeams: List<Pair<TimelineReadingAnchor, TimelineReadingAnchor>> = emptyList(),
+): TimelineRefreshReadingBatch? {
+    val old = previous.filterNot { it.isPinned }
+    val head = old.firstOrNull() ?: return null
+    val baseline = TimelineReadingAnchor.from(head) ?: return null
+    val rowPositions = old.mapIndexed { index, item -> item.id to index }.toMap()
+    val statusPositions = old.mapIndexedNotNull { index, item ->
+        TimelineReadingAnchor.from(item)?.statusId?.let { it to index }
+    }.toMap()
+    val knownRows = previous.mapTo(HashSet()) { it.id }
+    val knownStatuses = previous.mapNotNullTo(HashSet()) { TimelineReadingAnchor.from(it)?.statusId }
+    val seenRows = HashSet<String>()
+    val seenStatuses = HashSet<String>()
+    val incoming = page.filter { item ->
+        if (item.isPinned) return@filter false
+        val status = TimelineReadingAnchor.from(item)?.statusId
+        if (item.id in seenRows || status != null && status in seenStatuses) return@filter false
+        seenRows += item.id
+        if (status != null) seenStatuses += status
+        true
+    }
+    val headIndex = incoming.indexOfFirst(baseline::matches)
+    if (headIndex < 0) return null
+    val headTime = feedItemSortKey(head)
+    val batch = mutableListOf<TimelineReadingAnchor>()
+    var lastKnown = -1
+    var lastTime = 0L
+    for ((index, item) in incoming.withIndex()) {
+        val identity = TimelineReadingAnchor.from(item) ?: return null
+        val rowPosition = rowPositions[item.id]
+        val statusPosition = identity.statusId?.let(statusPositions::get)
+        if (rowPosition != null && statusPosition != null && rowPosition != statusPosition) return null
+        val known = rowPosition ?: statusPosition
+        if (known != null) {
+            if (known <= lastKnown || index < headIndex) return null
+            lastKnown = known
+        } else if (item.id in knownRows || identity.statusId?.let(knownStatuses::contains) == true) {
+            // A known pin changing treatment doesn't become a fresh ordinary post.
+            if (index < headIndex) return null
+            continue
+        }
+        val time = feedItemSortKey(item)
+        if (time > 0) {
+            if (lastTime > 0 && time > lastTime) return null
+            lastTime = time
+        }
+        if (index < headIndex) {
+            if (time > 0 && headTime > 0 && time <= headTime) return null
+            batch += identity
+        } else if (index > headIndex && known == null && time > 0 && headTime > 0 && time > headTime) {
+            return null
+        }
+    }
+    if (requiredSeams.any { (newer, older) ->
+            val newerIndex = incoming.indexOfFirst(newer::matches)
+            newerIndex < 0 || incoming.indexOfFirst(older::matches) <= newerIndex
+        }) return null
+    return TimelineRefreshReadingBatch(baseline, batch)
+}

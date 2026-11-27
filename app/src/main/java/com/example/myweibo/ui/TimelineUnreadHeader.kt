@@ -58,7 +58,7 @@ internal fun ObserveTimelineReadingBoundary(
 
     // This transparent sibling does not affect lazy list padding, row keys or scroll offset.
     Box(Modifier.fillMaxSize().onGloballyPositioned { listBounds = it.boundsInRoot() })
-    LaunchedEffect(home, scope, state, lifecycle) {
+    LaunchedEffect(home, scope, state, lifecycle, home.readingExposureGeneration) {
         fun exposedRowIds(): Set<String> {
             if (lifecycleState != Lifecycle.State.RESUMED || home.readingScope != scope ||
                 !home.feedInitialScrollReconciled || home.isLoading || state.isScrollInProgress
@@ -77,7 +77,7 @@ internal fun ObserveTimelineReadingBoundary(
                 // A snapshot/layout race during a refresh or a fold must not acknowledge a
                 // different post that happens to occupy the same index.
                 post.id.takeIf {
-                    it == row.key && !post.isPinned &&
+                    it == row.key && !post.isPinned && home.canObserveReadingRow(it) &&
                         isTimelineRowMeaningfullyVisible(row.offset, row.size, start, end)
                 }
             }

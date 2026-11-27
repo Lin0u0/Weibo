@@ -16,8 +16,10 @@ internal suspend fun LazyListState.resumeReadingAt(index: Int, key: String, isCu
         scrollToItem(index, if (index < firstVisibleItemIndex) step else -step)
     }
     if (!isCurrent()) return
-    val distance = targetOffset()
-    if (distance != null && distance != 0) {
+    // A remeasure may have invalidated the old index; never finish by snapping
+    // to an arbitrary row at the old numeric position.
+    val distance = targetOffset() ?: return
+    if (distance != 0) {
         scroll {
             var moved = 0f
             // Native Compose animation uses the system motion-duration scale. User input
