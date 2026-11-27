@@ -43,6 +43,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.animateBounds
@@ -163,6 +165,8 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -212,6 +216,8 @@ import androidx.compose.runtime.withFrameMillis
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -283,6 +289,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -328,6 +335,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
@@ -422,10 +430,12 @@ import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.FeedTimelineRefreshProjection
 import com.example.myweibo.data.TimelinePage
-import com.example.myweibo.data.TimelineUnreadScope
-import com.example.myweibo.data.TimelineUnreadSnapshot
-import com.example.myweibo.data.TimelineUnreadStore
-import com.example.myweibo.data.feedItemSortKey
+import com.example.myweibo.data.TimelineReadingAnchor
+import com.example.myweibo.data.TimelineReadingBoundaryStore
+import com.example.myweibo.data.TimelineReadingScope
+import com.example.myweibo.data.advanceTimelineReadingAnchor
+import com.example.myweibo.data.hasChronologicalResponse
+import com.example.myweibo.data.countNewTimelinePosts
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.mergeFeedTimelineRefresh
 import com.example.myweibo.data.projectFeedTimelineRefresh
@@ -444,6 +454,8 @@ import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
 import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSwitch
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -536,14 +548,10 @@ private enum class MineContentTab(val label: String) {
     Likes("赞过")
 }
 
-private fun feedRefreshHintMessage(
-    previousItems: List<FeedItem>,
-    refreshedItems: List<FeedItem>,
-): String {
-    val previousIds = previousItems.asSequence().map { it.statusId }.toSet()
-    val newCount = refreshedItems.count { it.statusId !in previousIds }
-    return if (newCount == 0) "\u6682\u65E0\u65B0\u5FAE\u535A" else "\u66F4\u65B0\u4E86 $newCount \u6761\u5FAE\u535A"
-}
+private const val FeedNoNewPostsHint = "没有新微博了"
+
+private fun LazyListState.isAtHomeTimelineTop(): Boolean =
+    layoutInfo.totalItemsCount > 0 && firstVisibleItemIndex == 0 && firstVisibleItemScrollOffset == 0
 
 private const val BottomBarHideGestureThresholdPx = 36f
 private const val ListLoadMoreItemsFromBottom = 3
@@ -554,9 +562,7 @@ internal fun TimelineKind.hasOrderedRefresh(groupId: String?, current: List<Feed
     TimelineKind.SpecialFollowing -> {
         // User group snapshots are already sorted by the home feed. The standalone
         // Special Following route keeps server order; only compare a chronological snapshot.
-        groupId != null || current.filterNot { it.isPinned }.map(::feedItemSortKey).let { dates ->
-            dates.all { it > 0 } && dates.zipWithNext().all { (newer, older) -> newer >= older }
-        }
+        groupId != null || hasChronologicalResponse(current)
     }
     TimelineKind.Hot, TimelineKind.Nearby, TimelineKind.Favorites, TimelineKind.Liked -> false
 }
@@ -4261,7 +4267,7 @@ internal class HomeTimelineReadingState(
     val cacheStore: TimelineCacheStore,
     initialKind: TimelineKind,
     initialPreferences: ReadingPreferences = preferencesStore.read(),
-    private val unreadStore: TimelineUnreadStore? = null,
+    private val boundaryStore: TimelineReadingBoundaryStore? = null,
 ) {
     var preferences by mutableStateOf(initialPreferences)
         private set
@@ -4273,9 +4279,13 @@ internal class HomeTimelineReadingState(
     var timelineGroupsOwnerId by mutableStateOf<String?>(null)
     var selectedTimelineGroupId by mutableStateOf<String?>(null)
     var items by mutableStateOf<List<FeedItem>>(emptyList())
-    var reverseBrowsePreviousHeadId by mutableStateOf<String?>(null)
+    private var protectReadingProjection by mutableStateOf(false)
+    private var forceDockProjection by mutableStateOf(false)
+    private var protectedNewPostFloor by mutableIntStateOf(0)
+    private var suppressHistoricalNewPostsMarker by mutableStateOf(false)
     var reverseBrowseGapExpanded by mutableStateOf(false)
         private set
+    private var pendingGapExpansionAnchor: Pair<String, Int>? = null
     // A cold disk page has not yet been confirmed by a successful network refresh.
     var timelineVerifiedFromNetwork by mutableStateOf(false)
     var nextCursor by mutableStateOf<String?>(null)
@@ -4294,47 +4304,59 @@ internal class HomeTimelineReadingState(
     var timelineCacheSessionGeneration by mutableIntStateOf(0)
     var timelineCacheAccountId by mutableStateOf<String?>(null)
 
-    val unreadScope by derivedStateOf {
-        TimelineUnreadScope.of(timelineCacheAccountId, timelineKind, selectedTimelineGroupId)
+    private val readingRoute by derivedStateOf {
+        TimelineReadingScope.of(timelineCacheAccountId, timelineKind, selectedTimelineGroupId)
     }
-    private var unreadRoute by mutableStateOf<Pair<TimelineUnreadScope, TimelineUnreadSnapshot>?>(null)
-    val activeUnreadSnapshot: TimelineUnreadSnapshot
-        get() = unreadRoute?.takeIf { it.first == unreadScope }?.second ?: TimelineUnreadSnapshot()
-    val visibleUnreadCount: Int get() = activeUnreadSnapshot.displayCount
+    private var readingRowsOwner by mutableStateOf<TimelineReadingScope?>(null)
+    val readingScope: TimelineReadingScope? get() = readingRowsOwner?.takeIf { it == readingRoute }
+    private var persistedBoundary by mutableStateOf<Pair<TimelineReadingScope, TimelineReadingAnchor?>?>(null)
+    private var disconnectedAt = emptySet<TimelineReadingAnchor>()
+    private var resumeReadingJob: Job? = null
+    internal val readingAnchor: TimelineReadingAnchor?
+        get() = persistedBoundary?.takeIf { it.first == readingScope }?.second
 
-    fun restoreUnread() {
-        val scope = unreadScope
-        if (scope == unreadRoute?.first) return
-        unreadRoute = scope?.let { route -> unreadStore?.read(route)?.let { route to it } }
-    }
-
-    private fun updateUnread(scope: TimelineUnreadScope, update: (TimelineUnreadSnapshot) -> TimelineUnreadSnapshot) {
-        if (scope != unreadScope) return
-        restoreUnread()
-        val previous = activeUnreadSnapshot
-        val updated = update(previous)
-        if (updated != previous) {
-            unreadStore?.write(scope, updated)
-            unreadRoute = scope to updated
+    /** Called only after displaying an account-owned cache or an accepted network page. */
+    fun acceptReadingRows(verifiedAccountId: String?, chronological: Boolean) {
+        val route = readingRoute?.takeIf { it.accountId == verifiedAccountId && chronological }
+        readingRowsOwner = route
+        if (route != null && persistedBoundary?.first != route) {
+            persistedBoundary = route to boundaryStore?.read(route)
         }
     }
 
-    fun recordUnreadRefresh(verifiedAccountId: String?, page: TimelinePage) {
-        val scope = unreadScope?.takeIf { it.accountId == verifiedAccountId } ?: return
-        updateUnread(scope) { it.refreshed(scope, page.items, items) }
+    fun markReadingRowsViewed(scope: TimelineReadingScope, rowIds: Set<String>) {
+        if (scope != readingScope) return
+        val previous = readingAnchor
+        val updated = advanceTimelineReadingAnchor(previous, items, rowIds, disconnectedAt)
+        if (updated != null && updated != previous) {
+            boundaryStore?.write(scope, updated)
+            persistedBoundary = scope to updated
+        }
     }
 
-    fun markUnreadViewed(scope: TimelineUnreadScope, statusIds: Set<String>) {
-        updateUnread(scope) { it.markViewed(statusIds) }
+    private val readingAnchorRow by derivedStateOf {
+        readingAnchor?.let { anchor -> items.firstOrNull(anchor::matches) }
     }
+    private val projectionBoundaryId: String?
+        get() = readingAnchorRow?.id?.takeIf { protectReadingProjection && (preferences.reverseReading || forceDockProjection) }
 
     val feedProjection by derivedStateOf {
         projectFeedTimelineRefresh(
             items,
-            reverseBrowsePreviousHeadId.takeIf { preferences.reverseReading && timelineVerifiedFromNetwork },
-            preferences.newPostLimit,
+            projectionBoundaryId,
+            maxOf(preferences.newPostLimit, protectedNewPostFloor),
             reverseBrowseGapExpanded,
-        )
+        ).suppressHistoricalMarkerIfNeeded()
+    }
+
+    private fun FeedTimelineRefreshProjection.suppressHistoricalMarkerIfNeeded(): FeedTimelineRefreshProjection =
+        if (suppressHistoricalNewPostsMarker && newPostsMarkerIndex != null) copy(newPostsMarkerIndex = null) else this
+
+    /** Exact keyed boundary in the rendered list, including any divider, never a guessed date. */
+    val readingBoundaryLazyIndex by derivedStateOf {
+        val key = readingAnchorRow?.id ?: return@derivedStateOf null
+        val projection = feedProjection
+        projection.visibleItems.indexOfFirst { it.id == key }.takeIf { it >= 0 }?.let(projection::lazyIndexOfPost)
     }
 
     fun updatePreferences(update: (ReadingPreferences) -> ReadingPreferences) {
@@ -4343,30 +4365,73 @@ internal class HomeTimelineReadingState(
             if (preferences.foldLongPosts != updated.foldLongPosts || preferences.maxLines != updated.maxLines) {
                 resetLongPostReading()
             }
+            if (preferences.newPostLimit != updated.newPostLimit) protectedNewPostFloor = 0
+            if (preferences.reverseReading && !updated.reverseReading && !forceDockProjection) resetGap()
             preferences = updated
         }
     }
 
-    fun resetGap() {
-        reverseBrowsePreviousHeadId = null
+    val hasProtectedReadingProjection: Boolean
+        get() = protectReadingProjection && (preferences.reverseReading || forceDockProjection)
+
+    private fun resetGap() {
+        protectReadingProjection = false
+        forceDockProjection = false
+        protectedNewPostFloor = 0
+        suppressHistoricalNewPostsMarker = false
         reverseBrowseGapExpanded = false
+        pendingGapExpansionAnchor = null
     }
 
-    fun onHomeTabReselected(listState: LazyListState, refresh: () -> Unit) {
-        val target = feedProjection.previousHeadLazyIndex
-        if (target == null) {
-            refresh()
+    fun onHomeTabReselected(listState: LazyListState, coroutineScope: CoroutineScope) {
+        val target = readingBoundaryLazyIndex ?: return
+        val key = readingAnchorRow?.id ?: return
+        val route = readingScope ?: return
+        // Explicit activation is the only resume trigger. A missing key is not a refresh,
+        // pagination request or reason to substitute a different post.
+        cancelReadingResume()
+        resumeReadingJob = coroutineScope.launch {
+            listState.resumeReadingAt(target, key) {
+                readingScope == route && readingBoundaryLazyIndex == target && readingAnchorRow?.id == key
+            }
+        }
+    }
+
+    fun cancelReadingResume() {
+        resumeReadingJob?.cancel()
+        resumeReadingJob = null
+    }
+
+    fun toggleTimelineGap(listState: LazyListState) {
+        if (feedProjection.gap == null) return
+        if (reverseBrowseGapExpanded) {
+            pendingGapExpansionAnchor = null
+            protectedNewPostFloor = 0
+            reverseBrowseGapExpanded = false
+            listState.retainHomeViewportIfKeyRemoved(feedProjection)
             return
         }
-        // Use the current projection (including an intervening divider), not the full-list
-        // index. Zero positions the old head at the list's padded content start.
-        listState.requestScrollToItem(target, scrollOffset = 0)
+        // Keeping the divider key would put the newly opened posts below the viewport
+        // anchor. Keep the first visible post (usually R) at the same offset instead.
+        val firstIndex = listState.firstVisibleItemIndex
+        val row = listState.layoutInfo.visibleItemsInfo.firstOrNull {
+            it.index >= firstIndex && it.key != FeedReverseBrowseGapKey
+        }
+        pendingGapExpansionAnchor = row?.let { item -> (item.key as? String)?.let { it to item.offset } }
+        reverseBrowseGapExpanded = true
     }
 
-    fun toggleTimelineGap() {
-        if (feedProjection.gap == null) return
-        // Rows above the keyed divider keep their position; no scroll or fetch is needed.
-        reverseBrowseGapExpanded = !reverseBrowseGapExpanded
+    fun applyGapExpansionAnchor(listState: LazyListState, projection: FeedTimelineRefreshProjection) {
+        val (key, offset) = pendingGapExpansionAnchor ?: return
+        pendingGapExpansionAnchor = null
+        val postIndex = projection.visibleItems.indexOfFirst { it.id == key }
+        if (postIndex < 0) return
+        val target = projection.lazyIndexOfPost(postIndex)
+        val firstIndex = listState.firstVisibleItemIndex
+        val firstRow = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == firstIndex }
+        if (target != firstIndex || firstRow == null || firstRow.key != key || firstRow.offset != offset) {
+            listState.requestScrollToItem(target, -offset)
+        }
     }
 
     fun currentVerifiedTimelineAccount(accountStore: WeiboAccountStore, requestedAccountId: String?): String? =
@@ -4384,28 +4449,45 @@ internal class HomeTimelineReadingState(
     } else null
 
     fun forgetTimelineCacheAccount() {
+        cancelReadingResume()
         timelineCacheSessionGeneration += 1
         timelineCacheAccountId = null
+        readingRowsOwner = null
+        persistedBoundary = null
+        disconnectedAt = emptySet()
         followingDiskIds = emptySet()
     }
 
-    fun publishRefresh(page: TimelinePage, listState: LazyListState, protectViewport: Boolean, keepReading: Boolean) {
+    fun publishRefresh(
+        page: TimelinePage,
+        listState: LazyListState,
+        protectViewport: Boolean,
+        keepReading: Boolean,
+        dockRefresh: Boolean = false,
+        successfulNoNewAtTop: Boolean = false,
+        reusePreviousRows: Boolean = true,
+    ) {
+        val ordered = selectedTimelineGroupId != null || timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle
+        val incoming = if (ordered) sortFeedTimelineItems(page.items) else page.items
         if (keepReading) {
-            if (page.items.isEmpty()) return
-            val previousHeadId = reverseBrowsePreviousHeadId ?: items.firstOrNull { !it.isPinned }?.id
-            val merged = mergeFeedTimelineRefresh(items, sortFeedTimelineItems(page.items))
-            val projected = projectFeedTimelineRefresh(merged, previousHeadId, preferences.newPostLimit, reverseBrowseGapExpanded)
-            // Read the live viewport, never the position from before the request.
-            listState.retainHomeViewportIfKeyRemoved(projected)
-            reverseBrowsePreviousHeadId = previousHeadId
+            if (incoming.isEmpty()) return
+            val merged = mergeFeedTimelineRefresh(items, incoming)
+            reconcileReadingContinuity(incoming, merged)
+            protectReadingProjection = true
+            forceDockProjection = forceDockProjection || dockRefresh
+            suppressHistoricalNewPostsMarker = successfulNoNewAtTop
+            val anchorId = readingAnchor?.let { anchor -> merged.firstOrNull(anchor::matches)?.id }
+            val newProjection = projectRefreshPreservingKey(listState, merged, anchorId)
+            // Coordinate with the live, keyed viewport, not the position before the request.
+            listState.retainHomeViewportIfKeyRemoved(newProjection)
             items = merged
+            timelineVerifiedFromNetwork = true
             // The first-page cursor does not belong to the retained tail.
             return
         }
         resetGap()
-        val ordered = selectedTimelineGroupId != null || timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle
-        val incoming = if (ordered) sortFeedTimelineItems(page.items) else page.items
-        val refreshed = replaceFeedTimelineRefresh(items, incoming)
+        disconnectedAt = emptySet()
+        val refreshed = replaceFeedTimelineRefresh(if (reusePreviousRows) items else emptyList(), incoming)
         if (protectViewport) {
             listState.retainHomeViewportIfKeyRemoved(FeedTimelineRefreshProjection(refreshed, gap = null))
         }
@@ -4417,6 +4499,51 @@ internal class HomeTimelineReadingState(
         }
     }
 
+    private fun projectRefreshPreservingKey(
+        listState: LazyListState,
+        merged: List<FeedItem>,
+        anchorId: String?,
+    ): FeedTimelineRefreshProjection {
+        val boundaryId = anchorId.takeIf { preferences.reverseReading || forceDockProjection }
+        val limit = preferences.newPostLimit
+        protectedNewPostFloor = 0
+        val projection = projectFeedTimelineRefresh(merged, boundaryId, limit, reverseBrowseGapExpanded)
+            .suppressHistoricalMarkerIfNeeded()
+        val firstKey = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == listState.firstVisibleItemIndex }?.key
+        if (projection.gap == null || projection.visibleItems.any { it.id == firstKey }) return projection
+        val index = merged.indexOfFirst { it.id == firstKey }
+        if (index < 0) return projection
+        // Don't fold away the currently matched row on a refresh. Keep the collapsed state
+        // and expose only as much of the new prefix as is needed to keep that key mounted.
+        protectedNewPostFloor = merged.subList(0, index + 1).count { !it.isPinned }
+        return projectFeedTimelineRefresh(merged, boundaryId, maxOf(limit, protectedNewPostFloor), reverseBrowseGapExpanded)
+            .suppressHistoricalMarkerIfNeeded()
+    }
+
+    private fun reconcileReadingContinuity(incoming: List<FeedItem>, merged: List<FeedItem>) {
+        if (readingScope == null) return
+        val previousOrdinary = items.filterNot { it.isPinned }
+        val incomingOrdinary = incoming.filterNot { it.isPinned }
+        val incomingRows = incomingOrdinary.mapTo(HashSet()) { it.id }
+        val incomingStatuses = incomingOrdinary.mapNotNullTo(HashSet()) { TimelineReadingAnchor.from(it)?.statusId }
+        fun occursInPage(anchor: TimelineReadingAnchor) = anchor.rowId in incomingRows || anchor.statusId?.let { it in incomingStatuses } == true
+        val ordinary = merged.filterNot { it.isPinned }
+        // A disjoint first page may leave a hole in the loaded list. Keep both sides for
+        // display/resume, but a date merge alone is not proof of contiguous reading.
+        if (previousOrdinary.none { TimelineReadingAnchor.from(it)?.let(::occursInPage) == true }) {
+            val previousKeys = previousOrdinary.mapTo(HashSet()) { it.id }
+            disconnectedAt = disconnectedAt + ordinary.zipWithNext().mapNotNull { (newer, older) ->
+                if (newer.id !in previousKeys && older.id in previousKeys) TimelineReadingAnchor.from(older) else null
+            }
+        } else if (disconnectedAt.isNotEmpty()) {
+            disconnectedAt = disconnectedAt.filterTo(mutableSetOf()) { seam ->
+                val index = ordinary.indexOfFirst(seam::matches)
+                val newer = ordinary.getOrNull(index - 1)?.let(TimelineReadingAnchor::from)
+                newer == null || !occursInPage(newer) || !occursInPage(seam)
+            }
+        }
+    }
+
     fun longPostController(listState: LazyListState): HomeLongPostController = longPostReading.controllerFor(listState)
 
     fun resetLongPostReading() {
@@ -4424,11 +4551,15 @@ internal class HomeTimelineReadingState(
     }
 
     fun resetTimelineReadingSession() {
+        cancelReadingResume()
         resetLongPostReading()
         timelineRefreshJob?.cancel()
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
         resetGap()
+        readingRowsOwner = null
+        persistedBoundary = null
+        disconnectedAt = emptySet()
         timelineVerifiedFromNetwork = false
         items = emptyList()
         nextCursor = null
@@ -4452,11 +4583,9 @@ fun WeiboApp() {
     val homeTimeline = remember {
         HomeTimelineReadingState(
             ReadingPreferencesStore(context), TimelineCacheStore(context), feedDisplaySettingsStore.readTimelineKind(),
-            unreadStore = TimelineUnreadStore(context),
+            boundaryStore = TimelineReadingBoundaryStore(context),
         )
     }
-    LaunchedEffect(homeTimeline.unreadScope) { homeTimeline.restoreUnread() }
-    val reverseBrowsingEnabled = homeTimeline.preferences.reverseReading
     var showCommentLikeCount by remember { mutableStateOf(feedDisplaySettingsStore.readShowCommentLikeCount()) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val searchHistoryStore = remember { SearchHistoryStore(context) }
@@ -4561,9 +4690,6 @@ fun WeiboApp() {
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
     var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
-    LaunchedEffect(reverseBrowsingEnabled) {
-        if (!reverseBrowsingEnabled) homeTimeline.resetGap()
-    }
     var selectedItem by remember { mutableStateOf<FeedItem?>(null) }
 
     LaunchedEffect(selectedItem?.actionMenuKey()) {
@@ -4901,7 +5027,7 @@ fun WeiboApp() {
             homeTimeline.timelineGroups = emptyList()
             homeTimeline.timelineGroupsOwnerId = null
             homeTimeline.forgetTimelineCacheAccount()
-            if (previousActiveAccountId != null || homeTimeline.reverseBrowsePreviousHeadId != null) {
+            if (previousActiveAccountId != null) {
                 homeTimeline.resetTimelineReadingSession()
                 if (homeTimeline.selectedTimelineGroupId != null) {
                     homeTimeline.timelineKind = TimelineKind.Following
@@ -6424,6 +6550,8 @@ fun WeiboApp() {
 
     fun refreshTimeline(showRefreshHint: Boolean = true, dockGesture: Boolean = false) {
         if (dockGesture && homeTimeline.timelineRefreshJob?.isActive == true) return
+        homeTimeline.feedRefreshHint = null
+        homeTimeline.cancelReadingResume()
         homeTimeline.timelineRefreshJob?.cancel()
         homeTimeline.timelineLoadMoreJob?.cancel()
         homeTimeline.timelineRequestGeneration += 1
@@ -6439,7 +6567,10 @@ fun WeiboApp() {
 
         homeTimeline.timelineRefreshJob = scope.launch {
             val previousItems = homeTimeline.items
-            val preserveViewport = homeTimeline.preferences.reverseReading && previousItems.isNotEmpty() &&
+            val previousReadingOwner = homeTimeline.readingScope
+            val startedAtTop = feedListState.isAtHomeTimelineTop()
+            val preserveViewport = (dockGesture || homeTimeline.preferences.reverseReading ||
+                startedAtTop && homeTimeline.hasProtectedReadingProjection) && previousItems.isNotEmpty() &&
                 requestedKind.hasOrderedRefresh(requestedGroupId, previousItems)
             homeTimeline.isLoading = true
             homeTimeline.feedLoadingMore = false
@@ -6448,8 +6579,8 @@ fun WeiboApp() {
                 if (!dockGesture && !preserveViewport && feedListState.layoutInfo.totalItemsCount > 0) {
                     feedListState.animateScrollToTopSmooth()
                 }
-                val unreadOwner = homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
-                val cacheAccountId = unreadOwner.takeIf { requestedKind == TimelineKind.Following && requestedGroupId == null }
+                val requestedOwner = homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
+                val cacheAccountId = requestedOwner.takeIf { requestedKind == TimelineKind.Following && requestedGroupId == null }
                 runCatchingPreservingCancellation {
                     if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
                         val raw = requestedGroupId?.let { session.loadTimelineGroupRaw(it) }
@@ -6461,25 +6592,39 @@ fun WeiboApp() {
                 }
                     .onSuccess { (page, raw) ->
                         if (!routeIsCurrent()) return@onSuccess
-                        val protectViewport = preserveViewport && homeTimeline.preferences.reverseReading && homeTimeline.items.isNotEmpty()
-                        val keepReading = protectViewport && homeTimeline.timelineVerifiedFromNetwork
-                        if (protectViewport && !keepReading && page.items.isEmpty()) {
-                            // An empty page cannot verify an unowned cache as the baseline.
+                        val verifiedOwner = requestedOwner?.takeIf {
+                            cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration &&
+                                it == homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
+                        }
+                        val orderedResponse = requestedKind.hasOrderedRefresh(requestedGroupId, page.items)
+                        val sameVerifiedBaseline = verifiedOwner != null && previousReadingOwner?.accountId == verifiedOwner &&
+                            previousReadingOwner == homeTimeline.readingScope
+                        val newCount = countNewTimelinePosts(previousItems, page.items, ordered = orderedResponse &&
+                            requestedKind.hasOrderedRefresh(requestedGroupId, previousItems))
+                        val noNewAtTop = showRefreshHint && newCount == 0 && (!orderedResponse || sameVerifiedBaseline) &&
+                            startedAtTop && feedListState.isAtHomeTimelineTop()
+                        val protectViewport = preserveViewport && (dockGesture || homeTimeline.preferences.reverseReading ||
+                            noNewAtTop && homeTimeline.hasProtectedReadingProjection) && homeTimeline.items.isNotEmpty()
+                        // A network response verifies only its own rows, never a speculative
+                        // merge with an unowned tail. An owned disk page is already a valid baseline.
+                        val keepReading = protectViewport && orderedResponse && sameVerifiedBaseline
+                        if ((dockGesture || preserveViewport) && page.items.isEmpty() && previousItems.isNotEmpty()) {
+                            // An empty response is not a no-new result or a replacement for
+                            // previously retained history, including any hidden gap rows.
                             homeTimeline.feedRefreshHint = null
                             showMessage("没有读取到微博", "请稍后刷新")
                             return@onSuccess
                         }
-                        if (dockGesture && page.items.isEmpty() && previousItems.isNotEmpty()) {
-                            homeTimeline.feedRefreshHint = null
-                            showMessage("没有读取到微博", "请稍后刷新")
-                            return@onSuccess
+                        if (!keepReading) {
+                            homeTimeline.acceptReadingRows(null, chronological = false)
                         }
-                        if (unreadOwner != null && cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration &&
-                            unreadOwner == homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
-                        ) {
-                            homeTimeline.recordUnreadRefresh(unreadOwner, page)
-                        }
-                        homeTimeline.publishRefresh(page, feedListState, protectViewport || (dockGesture && previousItems.isNotEmpty()), keepReading)
+                        homeTimeline.publishRefresh(
+                            page, feedListState, protectViewport || (dockGesture && previousItems.isNotEmpty()), keepReading,
+                            dockRefresh = dockGesture, successfulNoNewAtTop = noNewAtTop,
+                            reusePreviousRows = verifiedOwner == null || sameVerifiedBaseline,
+                        )
+                        homeTimeline.acceptReadingRows(verifiedOwner, orderedResponse && homeTimeline.items.isNotEmpty() &&
+                            requestedKind.hasOrderedRefresh(requestedGroupId, homeTimeline.items))
                         if (page.items.isNotEmpty() || !keepReading) preservedFeedSourceItem = null
                         reconcileFeedLikeState(page.items)
                         if (requestedKind == TimelineKind.SpecialFollowing) {
@@ -6511,8 +6656,12 @@ fun WeiboApp() {
                             } else {
                                 showMessage("没有读取到微博", "请稍后刷新")
                             }
-                        } else if (!protectViewport && showRefreshHint && refreshHintGeneration == homeTimeline.feedRefreshHintGeneration) {
-                            homeTimeline.feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
+                        } else if (showRefreshHint && refreshHintGeneration == homeTimeline.feedRefreshHintGeneration) {
+                            homeTimeline.feedRefreshHint = when {
+                                noNewAtTop && feedListState.isAtHomeTimelineTop() -> FeedNoNewPostsHint
+                                !protectViewport && newCount != null && newCount > 0 -> "更新了 $newCount 条微博"
+                                else -> null
+                            }
                         } else {
                             homeTimeline.feedRefreshHint = null
                         }
@@ -6543,24 +6692,24 @@ fun WeiboApp() {
 
     fun refreshTimelineFromTop() = refreshTimeline()
 
-    fun switchTimelineKind(kind: TimelineKind, dockGesture: Boolean = false) {
+    fun switchTimelineKind(kind: TimelineKind) {
         if (kind == homeTimeline.timelineKind && homeTimeline.selectedTimelineGroupId == null) return
         homeTimeline.resetTimelineReadingSession()
         preservedFeedSourceItem = null
         homeTimeline.timelineKind = kind
         homeTimeline.selectedTimelineGroupId = null
         feedDisplaySettingsStore.writeTimelineKind(kind)
-        refreshTimeline(showRefreshHint = false, dockGesture = dockGesture)
+        refreshTimeline(showRefreshHint = false)
     }
 
-    fun switchTimelineGroup(group: TimelineGroup, selectFeed: Boolean = true, dockGesture: Boolean = false) {
+    fun switchTimelineGroup(group: TimelineGroup, selectFeed: Boolean = true) {
         homeTimeline.resetTimelineReadingSession()
         preservedFeedSourceItem = null
         homeTimeline.selectedTimelineGroupId = group.id
         homeTimeline.timelineKind = TimelineKind.SpecialFollowing
         feedDisplaySettingsStore.writeTimelineKind(TimelineKind.SpecialFollowing)
         if (selectFeed) selectedTab = MainTab.Feed
-        refreshTimeline(showRefreshHint = false, dockGesture = dockGesture)
+        refreshTimeline(showRefreshHint = false)
     }
 
     fun loadMore() {
@@ -6614,6 +6763,9 @@ fun WeiboApp() {
                         page.items.collectAllEmoticons()
                     }
                     if (!routeIsCurrent()) return@onSuccess
+                    if (!requestedKind.hasOrderedRefresh(requestedGroupId, merged)) {
+                        homeTimeline.acceptReadingRows(null, chronological = false)
+                    }
                     homeTimeline.items = merged
                     reconcileFeedLikeState(page.items)
                     absorbDiscoveredEmoticons(discoveredEmoticons)
@@ -8173,9 +8325,11 @@ fun WeiboApp() {
             cachedTimeline?.takeIf {
                 cacheRouteGeneration == homeTimeline.timelineRequestGeneration && accountId == homeTimeline.timelineCacheAccountId &&
                     accountId == activeAccountId && accountId == accountStore.readActiveAccountId() &&
+                    homeTimeline.currentVerifiedTimelineAccount(accountStore, activeAccountId) == accountId &&
                     homeTimeline.timelineKind == TimelineKind.Following && homeTimeline.selectedTimelineGroupId == null
             }?.let { page ->
                 homeTimeline.items = sortFeedTimelineItems(page.items)
+                homeTimeline.acceptReadingRows(accountId, chronological = true)
                 homeTimeline.nextCursor = page.nextCursor
                 homeTimeline.followingDiskIds = homeTimeline.items.mapTo(HashSet()) { it.id }
                 val anchorId = homeTimeline.cacheStore.readFollowingAnchor(accountId)
@@ -8815,10 +8969,11 @@ fun WeiboApp() {
             LocalFeedEmoticonInlineContent provides feedEmoticonInlineContent,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
-            val unreadFeedOnTop = selectedTab == MainTab.Feed && hasLoginCookie &&
+            val readingFeedOnTop = selectedTab == MainTab.Feed && hasLoginCookie &&
                 activeAccountId != null && homeTimeline.timelineCacheAccountId == activeAccountId &&
                 selectedItem == null && visitedUserId == null && navOverlayStack.isEmpty() &&
                 navExitPendingKind == null && likeUsersOverlay == null && commentComposeTarget == null &&
+                mediaPreview == null && articleOverlay == null && albumViewerState == null &&
                 !timelineMenuExpanded && message == null
             Box(
                 Modifier.fillMaxSize()
@@ -9055,7 +9210,7 @@ fun WeiboApp() {
                                 hasLoginCookie = hasLoginCookie,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
-                                unreadUiOnTop = unreadFeedOnTop,
+                                readingUiOnTop = readingFeedOnTop,
                                 onRefresh = { refreshTimeline() },
                                 onLoadMore = { loadMore() },
                                 onOpenLoginSettings = ::openAccountLoginManagement,
@@ -10164,11 +10319,20 @@ fun WeiboApp() {
                 }
             }
             Box(Modifier.fillMaxSize()) {
+            LaunchedEffect(homeTimeline, feedListState) {
+                snapshotFlow {
+                    homeTimeline.feedRefreshHint == FeedNoNewPostsHint &&
+                        (selectedTab != MainTab.Feed || selectedItem != null || visitedUserId != null || !feedListState.isAtHomeTimelineTop())
+                }.collect { leftTop ->
+                    if (leftTop && homeTimeline.feedRefreshHint == FeedNoNewPostsHint) homeTimeline.feedRefreshHint = null
+                }
+            }
             val feedCapsuleHint = if (
                 selectedTab == MainTab.Feed &&
                 selectedItem == null &&
                 visitedUserId == null &&
-                homeTimeline.feedRefreshHint != null
+                homeTimeline.feedRefreshHint != null &&
+                (homeTimeline.feedRefreshHint != FeedNoNewPostsHint || feedListState.isAtHomeTimelineTop())
             ) {
                 homeTimeline.feedRefreshHint
             } else {
@@ -10206,7 +10370,6 @@ fun WeiboApp() {
                 }
             }
             TimelineUnreadHeader(
-                count = if (unreadFeedOnTop && saveHintState == null && !exitHintVisible) homeTimeline.visibleUnreadCount else 0,
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = feedRefreshTopInset + 10.dp).zIndex(90f),
             ) {
                 key(homeTimeline.feedRefreshHintGeneration) {
@@ -10251,29 +10414,21 @@ fun WeiboApp() {
                     )
                 }
             }
-            fun openDockTimeline(kind: TimelineKind, refresh: Boolean = false) {
+            fun openDockTimeline(kind: TimelineKind) {
                 leaveRetainedSearchForTabSwitch()
                 dismissFollowListForTabSwitch()
                 selectedTab = MainTab.Feed
-                if (refresh && kind == homeTimeline.timelineKind && homeTimeline.selectedTimelineGroupId == null) {
-                    refreshTimeline(dockGesture = true)
-                } else {
-                    switchTimelineKind(kind, dockGesture = refresh)
-                }
+                switchTimelineKind(kind)
             }
-            fun openDockGroup(group: TimelineGroup, refresh: Boolean = false) {
+            fun openDockGroup(group: TimelineGroup) {
                 val ownerId = homeTimeline.timelineGroupsOwnerId ?: return
                 if (!hasLoginCookie || ownerId != activeAccountId || ownerId != homeTimeline.timelineCacheAccountId ||
                     homeTimeline.timelineGroups.none { it.id == group.id }
                 ) return
                 leaveRetainedSearchForTabSwitch()
                 dismissFollowListForTabSwitch()
-                if (homeTimeline.selectedTimelineGroupId == group.id) {
-                    selectedTab = MainTab.Feed
-                    if (refresh) refreshTimeline(dockGesture = true)
-                } else {
-                    switchTimelineGroup(group, dockGesture = refresh)
-                }
+                if (homeTimeline.selectedTimelineGroupId == group.id) selectedTab = MainTab.Feed
+                else switchTimelineGroup(group)
             }
             val visibleTimelineGroups = homeTimeline.timelineGroups.takeIf {
                 hasLoginCookie && activeAccountId != null &&
@@ -10343,17 +10498,26 @@ fun WeiboApp() {
                         onEntrySelected = { entry ->
                             entry.group?.let { openDockGroup(it) } ?: entry.timelineKind?.let { openDockTimeline(it) }
                         },
-                        onEntryDoubleClick = { entry ->
+                        onSelectedTimelineClick = {
                             bottomBarVisible = true
                             bottomBarScrollDistance[0] = 0f
-                            entry.group?.let { openDockGroup(it, refresh = true) }
-                                ?: entry.timelineKind?.let { openDockTimeline(it, refresh = true) }
+                            if (hasLoginCookie && homeTimeline.currentVerifiedTimelineAccount(accountStore, activeAccountId) != null) {
+                                homeTimeline.onHomeTabReselected(feedListState, scope)
+                            }
+                        },
+                        onEntryDoubleClick = {
+                            bottomBarVisible = true
+                            bottomBarScrollDistance[0] = 0f
+                            // The dock has matched the active item, including Home as an alias
+                            // for whichever timeline is active but not pinned to the dock.
+                            refreshTimeline(dockGesture = true)
                         },
                         profileAvatar = resolveViboDockAvatarRequest(
                             homeTimeline.timelineCacheAccountId, activeAccountId, hasLoginCookie, mineProfile, storedAccounts,
                         ),
                     ),
                     onTabChange = tabChange@{ tab ->
+                        if (tab != MainTab.Feed) homeTimeline.cancelReadingResume()
                         if (tab == MainTab.Search && selectedTab != MainTab.Search) {
                             // Retain the source without borrowing topic search’s results-back behavior.
                             pushNavigation(NavOverlayKind.DockSearch) {
@@ -10379,7 +10543,7 @@ fun WeiboApp() {
                         }
                         if (tab == selectedTab) {
                             when (tab) {
-                                MainTab.Feed -> homeTimeline.onHomeTabReselected(feedListState, ::refreshTimelineFromTop)
+                                MainTab.Feed -> switchTimelineKind(TimelineKind.Following)
                                 MainTab.Mine -> {
                                     scope.launch {
                                         if (minePagerPage == 0) {
@@ -11156,7 +11320,7 @@ internal fun FollowFeedScreen(
     onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
-    unreadUiOnTop: Boolean = feedUiOnTop && hasLoginCookie,
+    readingUiOnTop: Boolean = feedUiOnTop && hasLoginCookie,
 ) {
     val topInset = WindowInsets.statusBarsIgnoringVisibility.asPaddingValues().calculateTopPadding()
 
@@ -11180,13 +11344,18 @@ internal fun FollowFeedScreen(
     val timelineGap = projection.gap
     val dividerIndex = projection.dividerIndex
     val timelineGapExpanded = homeTimeline.reverseBrowseGapExpanded
+    if (timelineGapExpanded) {
+        // Consume the saved anchor after Compose publishes the expanded lazy item provider.
+        // A scroll requested in the click handler can be consumed against the collapsed indices.
+        SideEffect { homeTimeline.applyGapExpansionAnchor(listState, projection) }
+    }
     val isLoading = homeTimeline.isLoading
     val isGroupTimeline = homeTimeline.selectedTimelineGroupId != null || homeTimeline.timelineKind == TimelineKind.SpecialFollowing
     val lineLimit = homeTimeline.foldedPostLineLimit
     val longPostController = homeTimeline.longPostController(listState)
     val navTopInRoot = LocalImageReturnBarTop.current
-    // The home dock floats above the list rather than contributing to its content padding.
-    val scrollIndicatorBottomInset = 72.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    // Read the live dock edge: a hidden dock must not reserve its usual rail space.
+    val scrollIndicatorBottomInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val topContentInsetPx = with(LocalDensity.current) { topInset.toPx() }
     val sourceItems = homeTimeline.items
     LaunchedEffect(sourceItems, longPostController) {
@@ -11220,8 +11389,14 @@ internal fun FollowFeedScreen(
             flingBehavior = rememberWeiboListFlingBehavior(),
             modifier = Modifier.fillMaxSize().feedScrollIndicator(
                 state = listState,
-                topInset = topInset + 12.dp,
+                rows = FeedScrollRows(
+                    postCount = items.size,
+                    dividerIndex = dividerIndex,
+                    collapsedPostCount = if (timelineGapExpanded) 0 else timelineGap?.hiddenPostCount ?: 0,
+                ),
+                topInset = topInset,
                 bottomInset = scrollIndicatorBottomInset,
+                bottomOcclusionInRoot = navTopInRoot,
                 enabled = items.isNotEmpty(),
             ),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
@@ -11262,7 +11437,7 @@ internal fun FollowFeedScreen(
                         FeedReverseBrowseDivider(timelineGap.hiddenPostCount, timelineGapExpanded) {
                             // A layout-only toggle must not be mistaken for scrolling to the tail.
                             longPostController.suppressPagingForLayoutChange()
-                            homeTimeline.toggleTimelineGap()
+                            homeTimeline.toggleTimelineGap(listState)
                         }
                     }
                     return@items
@@ -11313,7 +11488,7 @@ internal fun FollowFeedScreen(
         modifier = Modifier.fillMaxSize(),
     ) {
         feedContent()
-        ObserveTimelineUnread(homeTimeline, listState, unreadUiOnTop, topContentInsetPx, navTopInRoot)
+        ObserveTimelineReadingBoundary(homeTimeline, listState, readingUiOnTop, topContentInsetPx, navTopInRoot)
         // A detail covers the still-mounted feed. Keep its readable viewport so the
         // expanded source card has the same collapse control at the return handoff.
         if (lineLimit != null) {
@@ -23380,6 +23555,7 @@ private fun UserPostsSearchScreen(
                 state = listState,
                 modifier = Modifier.fillMaxSize().feedScrollIndicator(
                     state = listState,
+                    rows = FeedScrollRows(postCount = posts.size),
                     bottomInset = 88.dp,
                     enabled = posts.isNotEmpty(),
                 ),
@@ -24091,7 +24267,8 @@ private fun SearchScreen(
                         flingBehavior = rememberWeiboListFlingBehavior(),
                         modifier = Modifier.fillMaxSize().feedScrollIndicator(
                             state = listState,
-                            topInset = topInset + 4.dp,
+                            rows = FeedScrollRows(postCount = resultItems.size),
+                            topInset = topInset,
                             bottomInset = listBottomInset,
                             enabled = activeQuery != null && activeSearchMode == SearchMode.Weibo && resultItems.isNotEmpty(),
                         ),
@@ -24749,7 +24926,8 @@ private fun MineScreen(
     onOpenOfficialProfile: ((UserProfile, Rect) -> Unit)? = null,
     showPullRefreshIndicator: Boolean = true,
 ) {
-    var showSettings by remember { mutableStateOf(false) }
+    val settingsVisibility = remember { MutableTransitionState(false) }
+    val showSettings = settingsVisibility.currentState || settingsVisibility.targetState
     DisposableEffect(showSettings) {
         onSettingsVisibilityChange(showSettings)
         onDispose { onSettingsVisibilityChange(false) }
@@ -24847,7 +25025,7 @@ private fun MineScreen(
         coroutineScope.launch {
             onPrepareAddAccount()
             onSettingsOpened()
-            showSettings = true
+            settingsVisibility.targetState = true
             showAccountManagement = true
         }
     }
@@ -24865,11 +25043,12 @@ private fun MineScreen(
     }
 
     if (showSettings) {
-        BackHandler {
+        val settingsStateHolder = rememberSaveableStateHolder()
+        BackHandler(enabled = settingsVisibility.targetState) {
             if (showAccountManagement) {
                 showAccountManagement = false
             } else {
-                showSettings = false
+                settingsVisibility.targetState = false
             }
         }
         if (showAccountManagement) {
@@ -24898,77 +25077,88 @@ private fun MineScreen(
                     }
                 }
                 SettingsPageShell(
-                title = "\u8D26\u53F7\u7BA1\u7406",
-                onBack = closeAccountManagement,
-            ) {
-                AccountLoginPanel(
-                    session = session,
-                    autoReturnToFeedOnLogin = storedAccounts.isEmpty(),
-                    onLoginSuccess = {
-                        coroutineScope.launch {
-                            delay(150)
-                            val isFirstLogin = storedAccounts.isEmpty()
-                            if (isFirstLogin) {
-                                showAccountManagement = false
-                                showSettings = false
+                    title = "\u8D26\u53F7\u7BA1\u7406",
+                    onBack = closeAccountManagement,
+                ) {
+                    AccountLoginPanel(
+                        session = session,
+                        autoReturnToFeedOnLogin = storedAccounts.isEmpty(),
+                        onLoginSuccess = {
+                            coroutineScope.launch {
+                                delay(150)
+                                val isFirstLogin = storedAccounts.isEmpty()
+                                if (isFirstLogin) {
+                                    showAccountManagement = false
+                                    settingsVisibility.targetState = false
+                                }
+                                onReturnToFeed()
+                                onSyncEmoticons()
                             }
+                        },
+                        onReturnToFeed = {
+                            coroutineScope.launch {
+                                onPersistLoginSession()
+                            }
+                            showAccountManagement = false
+                            settingsVisibility.targetState = false
                             onReturnToFeed()
-                            onSyncEmoticons()
-                        }
-                    },
-                    onReturnToFeed = {
-                        coroutineScope.launch {
-                            onPersistLoginSession()
-                        }
-                        showAccountManagement = false
-                        showSettings = false
-                        onReturnToFeed()
-                    },
-                )
-            }
+                        },
+                    )
+                }
             }
         } else {
-            SettingsScreen(
-                hasLoginCookie = hasLoginCookie,
-                accounts = storedAccounts,
-                activeAccountId = activeAccountId,
-                emoticonMap = emoticonMap,
-                emoticonSyncing = emoticonSyncing,
-                backgroundPlaybackEnabled = backgroundPlaybackEnabled,
-                onBackgroundPlaybackChange = onBackgroundPlaybackChange,
-                hideBottomBarOnFeedScroll = hideBottomBarOnFeedScroll,
-                onHideBottomBarOnFeedScrollChange = onHideBottomBarOnFeedScrollChange,
-                bottomBarFrostAmount = bottomBarFrostAmount,
-                onBottomBarFrostAmountChange = onBottomBarFrostAmountChange,
-                onBottomBarFrostAmountCommit = onBottomBarFrostAmountCommit,
-                bottomBarGlassAmount = bottomBarGlassAmount,
-                onBottomBarGlassAmountChange = onBottomBarGlassAmountChange,
-                onBottomBarGlassAmountCommit = onBottomBarGlassAmountCommit,
-                feedThumbnailQuality = feedThumbnailQuality,
-                onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
-                feedLineSpacing = feedLineSpacing,
-                onFeedLineSpacingChange = onFeedLineSpacingChange,
-                feedFontSize = feedFontSize,
-                onFeedFontSizeChange = onFeedFontSizeChange,
-                feedPreviewItem = feedPreviewItemProvider(),
-                selectedThemeColor = selectedThemeColor,
-                onThemeColorChange = onThemeColorChange,
-                appearanceMode = appearanceMode,
-                onAppearanceModeChange = onAppearanceModeChange,
-                onBack = {
-                    showAccountManagement = false
-                    showSettings = false
-                },
-                onSwitchAccount = onSwitchAccount,
-                onDeleteAccount = onDeleteAccount,
-                onAddAccount = {
-                    coroutineScope.launch {
-                        onPrepareAddAccount()
-                        showAccountManagement = true
-                    }
-                },
-                onSyncEmoticons = onSyncEmoticons,
-            )
+            val offsetPx = settingsStartOffsetPx()
+            AnimatedVisibility(
+                visibleState = settingsVisibility,
+                modifier = Modifier.fillMaxSize(),
+                enter = settingsPageEnter(offsetPx),
+                exit = settingsPageExit(offsetPx),
+            ) {
+                settingsStateHolder.SaveableStateProvider("settings") {
+                    SettingsScreen(
+                        active = settingsVisibility.targetState,
+                        hasLoginCookie = hasLoginCookie,
+                        accounts = storedAccounts,
+                        activeAccountId = activeAccountId,
+                        emoticonMap = emoticonMap,
+                        emoticonSyncing = emoticonSyncing,
+                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                        onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                        hideBottomBarOnFeedScroll = hideBottomBarOnFeedScroll,
+                        onHideBottomBarOnFeedScrollChange = onHideBottomBarOnFeedScrollChange,
+                        bottomBarFrostAmount = bottomBarFrostAmount,
+                        onBottomBarFrostAmountChange = onBottomBarFrostAmountChange,
+                        onBottomBarFrostAmountCommit = onBottomBarFrostAmountCommit,
+                        bottomBarGlassAmount = bottomBarGlassAmount,
+                        onBottomBarGlassAmountChange = onBottomBarGlassAmountChange,
+                        onBottomBarGlassAmountCommit = onBottomBarGlassAmountCommit,
+                        feedThumbnailQuality = feedThumbnailQuality,
+                        onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
+                        feedLineSpacing = feedLineSpacing,
+                        onFeedLineSpacingChange = onFeedLineSpacingChange,
+                        feedFontSize = feedFontSize,
+                        onFeedFontSizeChange = onFeedFontSizeChange,
+                        feedPreviewItem = feedPreviewItemProvider(),
+                        selectedThemeColor = selectedThemeColor,
+                        onThemeColorChange = onThemeColorChange,
+                        appearanceMode = appearanceMode,
+                        onAppearanceModeChange = onAppearanceModeChange,
+                        onBack = {
+                            showAccountManagement = false
+                            settingsVisibility.targetState = false
+                        },
+                        onSwitchAccount = onSwitchAccount,
+                        onDeleteAccount = onDeleteAccount,
+                        onAddAccount = {
+                            coroutineScope.launch {
+                                onPrepareAddAccount()
+                                showAccountManagement = true
+                            }
+                        },
+                        onSyncEmoticons = onSyncEmoticons,
+                    )
+                }
+            }
         }
         return
     }
@@ -25291,6 +25481,7 @@ private fun MineScreen(
                                 flingBehavior = rememberWeiboListFlingBehavior(),
                                 modifier = Modifier.fillMaxSize().feedScrollIndicator(
                                     state = postsListState,
+                                    rows = FeedScrollRows(postCount = posts.size),
                                     bottomInset = 96.dp,
                                     enabled = posts.isNotEmpty(),
                                 ),
@@ -25485,7 +25676,7 @@ private fun MineScreen(
         IconButton(
             onClick = {
                 onSettingsOpened()
-                showSettings = true
+                settingsVisibility.targetState = true
             },
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -25516,14 +25707,36 @@ private fun MineScreen(
     }
 }
 
+// These transitions stay in Compose, so the system animator-duration scale also applies here.
+private const val SettingsMotionMillis = 200
+
+@Composable
+private fun settingsStartOffsetPx(): Int {
+    val distance = with(LocalDensity.current) { 12.dp.roundToPx() }
+    return if (LocalLayoutDirection.current == LayoutDirection.Ltr) distance else -distance
+}
+
+private fun settingsPageEnter(offsetPx: Int) = fadeIn(tween(SettingsMotionMillis)) +
+    slideInHorizontally(tween(SettingsMotionMillis)) { offsetPx }
+
+private fun settingsPageExit(offsetPx: Int) = fadeOut(tween(SettingsMotionMillis)) +
+    slideOutHorizontally(tween(SettingsMotionMillis)) { offsetPx }
+
+private fun settingsExpandEnter() = fadeIn(tween(SettingsMotionMillis)) +
+    expandVertically(tween(SettingsMotionMillis), expandFrom = Alignment.Top)
+
+private fun settingsExpandExit() = fadeOut(tween(SettingsMotionMillis)) +
+    shrinkVertically(tween(SettingsMotionMillis), shrinkTowards = Alignment.Top)
+
 @Composable
 private fun SettingsPageShell(
     title: String,
     onBack: () -> Unit,
+    modifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
     ) {
@@ -25539,9 +25752,12 @@ private fun SettingsPageShell(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+            }
             Text(
                 text = title,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).semantics { heading() },
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
@@ -25563,11 +25779,14 @@ internal fun SettingsList(
     topContentPadding: Dp = 12.dp,
     content: LazyListScope.(bottomContentPadding: Dp) -> Unit,
 ) {
+    // LazyListState is saveable under each settings page's key.
+    val listState = rememberLazyListState()
     // The scaffold is edge-to-edge. Keep the viewport behind the floating dock,
     // and reserve the dock and its navigation-bar lift only at the end of the list.
     val bottomContentPadding = 12.dp + SettingsBottomBarInset +
         WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     LazyColumn(
+        state = listState,
         flingBehavior = rememberWeiboListFlingBehavior(),
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
@@ -25582,8 +25801,56 @@ internal fun SettingsList(
     }
 }
 
+private enum class SettingsPage(val title: String, val summary: String? = null) {
+    Home("设置"),
+    Reading("阅读", "倒序浏览、长微博折叠、行距字号和评论点赞数"),
+    Appearance("外观与底栏", "深色模式、主题颜色和底栏"),
+    Media("媒体", "图片清晰度和后台播放声音"),
+    Account("账号与关于", "账号管理、表情同步、清理缓存和关于 Vibo"),
+    Dock("底栏"),
+    About("关于 Vibo"),
+    Help("使用说明"),
+    ;
+
+    val parentPage: SettingsPage? get() = when (this) {
+        Home -> null
+        Reading, Appearance, Media, Account -> Home
+        Dock -> Appearance
+        About -> Account
+        Help -> About
+    }
+    val depth: Int get() = (parentPage?.depth ?: -1) + 1
+}
+
+@Composable
+private fun SettingsNavigationRow(title: String, summary: String?, onOpen: () -> Unit) {
+    SettingsPlainCard {
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .clickable(role = Role.Button, onClick = onOpen)
+                .heightIn(min = 56.dp)
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                if (summary != null) {
+                    Text(
+                        summary,
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, lineHeight = 18.sp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+        }
+    }
+}
+
 @Composable
 private fun SettingsScreen(
+    active: Boolean,
     hasLoginCookie: Boolean,
     accounts: List<StoredWeiboAccount>,
     activeAccountId: String?,
@@ -25616,145 +25883,206 @@ private fun SettingsScreen(
     onAddAccount: () -> Unit,
     onSyncEmoticons: () -> Unit,
 ) {
-    var accountExpanded by remember { mutableStateOf(false) }
-    var emoticonExpanded by remember { mutableStateOf(false) }
-    var imageExpanded by remember { mutableStateOf(false) }
-    var typographyExpanded by remember { mutableStateOf(false) }
-    var themeExpanded by remember { mutableStateOf(false) }
-    var appearanceExpanded by remember { mutableStateOf(false) }
-    var showHelp by remember { mutableStateOf(false) }
-    val context = LocalContext.current
-    val versionName = remember {
-        runCatching {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName
-        }.getOrNull().orEmpty().ifBlank { "1.2" }
-    }
-
-    BackHandler {
-        if (showHelp) {
-            showHelp = false
-        } else {
-            onBack()
+    val pageStates = rememberSaveableStateHolder()
+    var pageName by rememberSaveable { mutableStateOf(SettingsPage.Home.name) }
+    val page = SettingsPage.valueOf(pageName)
+    val navigate: (SettingsPage) -> Unit = { if (active) pageName = it.name }
+    val goBack: () -> Unit = {
+        if (active) {
+            val parent = page.parentPage
+            if (parent == null) onBack() else navigate(parent)
         }
     }
+    BackHandler(enabled = active, onBack = goBack)
 
-    SettingsPageShell(title = if (showHelp) "使用说明" else "设置", onBack = onBack) {
-        if (showHelp) {
-            SettingsHelpContent()
-        } else {
-            val homeTimeline = LocalHomeTimelineReadingState.current
-            val reading = homeTimeline?.preferences ?: ReadingPreferences()
-            SettingsList { bottomContentPadding ->
-                item {
-                    SettingsAccountCard(
-                        expanded = accountExpanded,
-                        onExpandedChange = { accountExpanded = it },
-                        accounts = accounts,
-                        activeAccountId = activeAccountId,
-                        hasLoginCookie = hasLoginCookie,
-                        onSwitchAccount = onSwitchAccount,
-                        onDeleteAccount = onDeleteAccount,
-                        onAddAccount = onAddAccount,
-                    )
-                }
-                item {
-                    SettingsEmoticonCard(
-                        expanded = emoticonExpanded,
-                        onExpandedChange = { emoticonExpanded = it },
-                        emoticonMap = emoticonMap,
-                        emoticonSyncing = emoticonSyncing,
-                        onSyncEmoticons = onSyncEmoticons,
-                    )
-                }
-                item {
-                    SettingsFeedDisplayCard(
-                        hideBottomBarOnScroll = hideBottomBarOnFeedScroll,
-                        onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
-                    )
-                }
-                item {
-                    ReadingFoldSettingsCard(
-                        enabled = reading.foldLongPosts,
-                        maxLines = reading.maxLines,
-                        onEnabledChange = { enabled -> homeTimeline?.updatePreferences { it.copy(foldLongPosts = enabled) } },
-                        onMaxLinesChange = { lines -> homeTimeline?.updatePreferences { it.copy(maxLines = lines) } },
-                        card = { content -> SettingsPlainCard(content = content) },
-                    )
-                }
-                item {
-                    ReverseReadingSettingsCard(
-                        enabled = reading.reverseReading,
-                        newPostLimit = reading.newPostLimit,
-                        onEnabledChange = { enabled -> homeTimeline?.updatePreferences { it.copy(reverseReading = enabled) } },
-                        onNewPostLimitChange = { limit -> homeTimeline?.updatePreferences { it.copy(newPostLimit = limit) } },
-                        card = { content -> SettingsPlainCard(content = content) },
-                    )
-                }
-                item {
-                    val dock = LocalViboDockState.current
-                    SettingsPlainCard {
-                        ViboDockSettings(
-                            dock.preferences, dock::update, Modifier.padding(12.dp),
-                            catalogue = LocalViboDockCatalogue.current,
-                        )
+    val context = LocalContext.current
+    val versionName = remember(context) {
+        runCatching {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+    val versionLabel = versionName?.let { "版本 $it" }
+    val offsetPx = settingsStartOffsetPx()
+    AnimatedContent(
+        targetState = page,
+        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        transitionSpec = {
+            val direction = if (targetState.depth > initialState.depth) 1 else -1
+            settingsPageEnter(direction * offsetPx) togetherWith settingsPageExit(-direction * offsetPx)
+        },
+        label = "settings_page",
+    ) { displayedPage ->
+        pageStates.SaveableStateProvider(displayedPage.name) {
+            val accessibility = if (displayedPage == page && active) Modifier else {
+                Modifier.semantics { hideFromAccessibility() }
+            }
+            SettingsPageShell(
+                title = displayedPage.title,
+                onBack = goBack,
+                modifier = accessibility,
+            ) {
+                if (displayedPage == SettingsPage.Help) {
+                    SettingsHelpContent()
+                } else {
+                    val homeTimeline = LocalHomeTimelineReadingState.current
+                    val reading = homeTimeline?.preferences ?: ReadingPreferences()
+                    var accountExpanded by rememberSaveable { mutableStateOf(false) }
+                    var emoticonExpanded by rememberSaveable { mutableStateOf(false) }
+                    var imageExpanded by rememberSaveable { mutableStateOf(false) }
+                    var typographyExpanded by rememberSaveable { mutableStateOf(false) }
+                    var themeExpanded by rememberSaveable { mutableStateOf(false) }
+                    var appearanceExpanded by rememberSaveable { mutableStateOf(false) }
+                    SettingsList { bottomContentPadding ->
+                        when (displayedPage) {
+                            SettingsPage.Home -> {
+                                listOf(SettingsPage.Reading, SettingsPage.Appearance, SettingsPage.Media, SettingsPage.Account)
+                                    .forEach { category ->
+                                        item(key = category.name) {
+                                            SettingsNavigationRow(category.title, category.summary) { navigate(category) }
+                                        }
+                                    }
+                            }
+                            SettingsPage.Reading -> {
+                                item(key = "reverse-reading") {
+                                    ReverseReadingSettingsCard(
+                                        enabled = reading.reverseReading,
+                                        newPostLimit = reading.newPostLimit,
+                                        onEnabledChange = { enabled -> homeTimeline?.updatePreferences { it.copy(reverseReading = enabled) } },
+                                        onNewPostLimitChange = { limit -> homeTimeline?.updatePreferences { it.copy(newPostLimit = limit) } },
+                                        card = { content -> SettingsPlainCard(content = content) },
+                                    )
+                                }
+                                item(key = "fold-long-posts") {
+                                    ReadingFoldSettingsCard(
+                                        enabled = reading.foldLongPosts,
+                                        maxLines = reading.maxLines,
+                                        onEnabledChange = { enabled -> homeTimeline?.updatePreferences { it.copy(foldLongPosts = enabled) } },
+                                        onMaxLinesChange = { lines -> homeTimeline?.updatePreferences { it.copy(maxLines = lines) } },
+                                        card = { content -> SettingsPlainCard(content = content) },
+                                    )
+                                }
+                                item(key = "typography") {
+                                    SettingsTypographyCard(
+                                        expanded = typographyExpanded,
+                                        onExpandedChange = { typographyExpanded = it },
+                                        lineSpacing = feedLineSpacing,
+                                        onLineSpacingChange = onFeedLineSpacingChange,
+                                        fontSize = feedFontSize,
+                                        onFontSizeChange = onFeedFontSizeChange,
+                                        previewItem = feedPreviewItem,
+                                        emoticonMap = emoticonMap,
+                                    )
+                                }
+                                item(key = "comment-likes") { SettingsCommentLikeCountCard() }
+                            }
+                            SettingsPage.Appearance -> {
+                                item(key = "appearance-mode") {
+                                    SettingsAppearanceCard(
+                                        expanded = appearanceExpanded,
+                                        onExpandedChange = { appearanceExpanded = it },
+                                        mode = appearanceMode,
+                                        onModeChange = onAppearanceModeChange,
+                                    )
+                                }
+                                item(key = "theme-color") {
+                                    SettingsThemeColorCard(
+                                        expanded = themeExpanded,
+                                        onExpandedChange = { themeExpanded = it },
+                                        selected = selectedThemeColor,
+                                        onSelected = onThemeColorChange,
+                                    )
+                                }
+                                item(key = "dock-entry") {
+                                    SettingsNavigationRow(SettingsPage.Dock.title, "底栏项目、图标文字、自动隐藏和液态玻璃") {
+                                        navigate(SettingsPage.Dock)
+                                    }
+                                }
+                            }
+                            SettingsPage.Dock -> {
+                                item(key = "dock-items") {
+                                    val dock = LocalViboDockState.current
+                                    SettingsPlainCard {
+                                        ViboDockSettings(
+                                            dock.preferences, dock::update, Modifier.padding(12.dp),
+                                            catalogue = LocalViboDockCatalogue.current,
+                                            showTitle = false,
+                                        )
+                                    }
+                                }
+                                item(key = "auto-hide-dock") {
+                                    SettingsFeedDisplayCard(
+                                        hideBottomBarOnScroll = hideBottomBarOnFeedScroll,
+                                        onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
+                                    )
+                                }
+                                item(key = "dock-glass") {
+                                    SettingsBottomBarGlassCard(
+                                        frostAmount = bottomBarFrostAmount,
+                                        onFrostChange = onBottomBarFrostAmountChange,
+                                        onFrostCommit = onBottomBarFrostAmountCommit,
+                                        glassAmount = bottomBarGlassAmount,
+                                        onGlassChange = onBottomBarGlassAmountChange,
+                                        onGlassCommit = onBottomBarGlassAmountCommit,
+                                    )
+                                }
+                            }
+                            SettingsPage.Media -> {
+                                item(key = "image-quality") {
+                                    SettingsImageCard(
+                                        expanded = imageExpanded,
+                                        onExpandedChange = { imageExpanded = it },
+                                        quality = feedThumbnailQuality,
+                                        onQualityChange = onFeedThumbnailQualityChange,
+                                    )
+                                }
+                                item(key = "background-audio") {
+                                    SettingsPlaybackCard(
+                                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                                        onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                                    )
+                                }
+                            }
+                            SettingsPage.Account -> {
+                                item(key = "accounts") {
+                                    SettingsAccountCard(
+                                        expanded = accountExpanded,
+                                        onExpandedChange = { accountExpanded = it },
+                                        accounts = accounts,
+                                        activeAccountId = activeAccountId,
+                                        hasLoginCookie = hasLoginCookie,
+                                        onSwitchAccount = onSwitchAccount,
+                                        onDeleteAccount = onDeleteAccount,
+                                        onAddAccount = onAddAccount,
+                                    )
+                                }
+                                item(key = "emoticons") {
+                                    SettingsEmoticonCard(
+                                        expanded = emoticonExpanded,
+                                        onExpandedChange = { emoticonExpanded = it },
+                                        emoticonMap = emoticonMap,
+                                        emoticonSyncing = emoticonSyncing,
+                                        onSyncEmoticons = onSyncEmoticons,
+                                    )
+                                }
+                                item(key = "cache") { SettingsCacheCard() }
+                                item(key = "about-entry") {
+                                    SettingsNavigationRow(SettingsPage.About.title, versionLabel) { navigate(SettingsPage.About) }
+                                }
+                            }
+                            SettingsPage.About -> {
+                                item(key = "version-and-links") {
+                                    SettingsAboutCard(versionName, bottomContentPadding, asDetail = true)
+                                }
+                                item(key = "help-entry") {
+                                    SettingsNavigationRow(SettingsPage.Help.title, "了解底部导航、手势操作与各页面功能") {
+                                        navigate(SettingsPage.Help)
+                                    }
+                                }
+                            }
+                            SettingsPage.Help -> Unit // Help owns its own lazy list.
+                        }
                     }
-                }
-                item {
-                    SettingsBottomBarGlassCard(
-                        frostAmount = bottomBarFrostAmount,
-                        onFrostChange = onBottomBarFrostAmountChange,
-                        onFrostCommit = onBottomBarFrostAmountCommit,
-                        glassAmount = bottomBarGlassAmount,
-                        onGlassChange = onBottomBarGlassAmountChange,
-                        onGlassCommit = onBottomBarGlassAmountCommit,
-                    )
-                }
-                item { SettingsCommentLikeCountCard() }
-                item {
-                    SettingsPlaybackCard(
-                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
-                        onBackgroundPlaybackChange = onBackgroundPlaybackChange,
-                    )
-                }
-                item {
-                    SettingsImageCard(
-                        expanded = imageExpanded,
-                        onExpandedChange = { imageExpanded = it },
-                        quality = feedThumbnailQuality,
-                        onQualityChange = onFeedThumbnailQualityChange,
-                    )
-                }
-                item {
-                    SettingsTypographyCard(
-                        expanded = typographyExpanded,
-                        onExpandedChange = { typographyExpanded = it },
-                        lineSpacing = feedLineSpacing,
-                        onLineSpacingChange = onFeedLineSpacingChange,
-                        fontSize = feedFontSize,
-                        onFontSizeChange = onFeedFontSizeChange,
-                        previewItem = feedPreviewItem,
-                        emoticonMap = emoticonMap,
-                    )
-                }
-                item {
-                    SettingsAppearanceCard(
-                        expanded = appearanceExpanded,
-                        onExpandedChange = { appearanceExpanded = it },
-                        mode = appearanceMode,
-                        onModeChange = onAppearanceModeChange,
-                    )
-                }
-                item {
-                    SettingsThemeColorCard(
-                        expanded = themeExpanded,
-                        onExpandedChange = { themeExpanded = it },
-                        selected = selectedThemeColor,
-                        onSelected = onThemeColorChange,
-                    )
-                }
-                item { SettingsCacheCard() }
-                item {
-                    SettingsAboutCard(versionName = versionName, bottomContentPadding = bottomContentPadding)
                 }
             }
         }
@@ -25770,7 +26098,7 @@ private val appHelpSections = listOf(
     HelpSection(
         title = "开始使用与账号",
         items = listOf(
-            "首次使用请进入「我的 → 设置 → 账号管理」完成微博网页登录。",
+            "首次使用请进入「我的 → 设置 → 账号与关于 → 账号管理」完成微博网页登录。",
             "账号管理可添加、切换和删除已保存账号；切换后按新账号重新加载数据。",
             "微博接口需要有效登录态；遇到登录失效提示时，请重新登录后刷新。",
         ),
@@ -25778,10 +26106,10 @@ private val appHelpSections = listOf(
     HelpSection(
         title = "底部导航与首页",
         items = listOf(
-            "底部依次为信息流、消息、搜索、写微博、我的。",
-            "长按第一个小房子图标，可切换「最新微博、好友圈、我的收藏、我的赞、热门、同城」或自定义分组；下方文字显示当前选择。",
+            "搜索和我的位于底栏两侧；中间项目可在「设置 → 外观与底栏 → 底栏」中调整。",
+            "长按支持切换的时间线图标，可查看可用时间线或自定义分组；开启「显示图标文字」后，图标下方显示名称。",
             "下拉刷新当前信息流，接近列表末尾时自动加载更多；刷新成功会显示更新条数提示。",
-            "「自动隐藏底栏」开启时，上滑隐藏、下滑显示；关闭后滚动时保持显示。进入设置和编辑等页面时底栏会隐藏。",
+            "「自动隐藏底栏」开启时，在信息流上滑隐藏、下滑显示；关闭后滚动时保持显示。",
             "首页连续按两次返回可退出应用。",
         ),
     ),
@@ -25862,7 +26190,7 @@ private val appHelpSections = listOf(
             "自动隐藏底栏、显示评论点赞数、后台播放声音为独立开关。",
             "表情同步可更新本地表情；图片清晰度可选省流、标准、高清，主要影响缩略图。",
             "行距与字号可调整正文阅读效果；深色模式支持浅色、深色和跟随系统。",
-            "在「我的 → 设置 → 主题颜色」选择配色，立即应用并自动保存，作用于导航、按钮和强调文字。",
+            "在「设置 → 外观与底栏 → 主题颜色」选择配色，立即应用并自动保存，作用于导航、按钮和强调文字。",
             "主题颜色提供九种柔和配色、一种灰色和十种鲜艳配色，新增亮青、亮绿、珊瑚红和洋红；深色模式可单独设置。",
             "内容加载失败可先下拉重试，登录失效则重新登录。删除本地账号不等于注销微博账号。",
             "本应用为非官方客户端，接口变化、隐私限制或风控可能影响部分内容及操作。",
@@ -25891,102 +26219,90 @@ private fun SettingsPlainCard(
 }
 
 @Composable
-private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
-    SettingsPlainCard(onClick = onOpen) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp),
-        ) {
-            Text(
-                text = "使用说明",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = "了解底部导航、手势操作与各页面功能",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@Composable
-internal fun SettingsAboutCard(versionName: String, bottomContentPadding: Dp) {
+internal fun SettingsAboutCard(
+    versionName: String?,
+    bottomContentPadding: Dp,
+    asDetail: Boolean = false,
+) {
     val context = LocalContext.current
-    var expanded by remember { mutableStateOf(false) }
-    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    var updateMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    val expansion = remember { MutableTransitionState(expanded) }
+    expansion.targetState = expanded
     val actionsBringIntoView = remember { BringIntoViewRequester() }
     var actionsSize by remember { mutableStateOf(IntSize.Zero) }
     val bottomContentPaddingPx = with(LocalDensity.current) { bottomContentPadding.toPx() }
-    LaunchedEffect(expanded, actionsSize, bottomContentPaddingPx, updateMessage) {
-        if (expanded && actionsSize.height > 0) {
-            // Include the inset: the actions can be inside the viewport but behind the dock.
+    LaunchedEffect(expanded, expansion.isIdle, actionsSize, bottomContentPaddingPx, updateMessage) {
+        if (!asDetail && expanded && expansion.isIdle && actionsSize.height > 0) {
+            // The actions can be inside the viewport but still behind the floating dock.
             withFrameNanos { }
             actionsBringIntoView.bringIntoView(
                 Rect(0f, 0f, actionsSize.width.toFloat(), actionsSize.height + bottomContentPaddingPx),
             )
         }
     }
-    fun openGitHub(url: String) {
-        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
-            .onFailure { updateMessage = "无法打开浏览器" }
-    }
+    val version = versionName?.let { "版本 $it" } ?: "版本不可用"
     SettingsPlainCard {
         Column {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable { expanded = !expanded }
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Image(
-                painter = painterResource(R.drawable.ic_launcher_app),
-                contentDescription = null,
-                modifier = Modifier
-                    .size(52.dp)
-                    .clip(RoundedCornerShape(14.dp)),
-                contentScale = ContentScale.Crop,
-            )
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(5.dp),
+            Row(
+                modifier = Modifier.fillMaxWidth()
+                    .then(if (asDetail) Modifier else Modifier.clickable { expanded = !expanded })
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                Text(
-                    text = "关于",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
+                Image(
+                    painter = painterResource(R.drawable.ic_launcher_app),
+                    contentDescription = null,
+                    modifier = Modifier.size(52.dp).clip(RoundedCornerShape(14.dp)),
+                    contentScale = ContentScale.Crop,
                 )
-                Text(
-                    text = "Vibo · 版本 $versionName",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(
+                        text = if (asDetail) "Vibo" else "关于",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    if (asDetail) {
+                        SelectionContainer {
+                            Text(version, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    } else {
+                        Text("Vibo · $version", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                if (!asDetail) SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
-            SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
-        }
-        if (expanded) {
-        Column(Modifier.fillMaxWidth()
-            .bringIntoViewRequester(actionsBringIntoView)
-            .onSizeChanged { actionsSize = it }) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            TextButton(onClick = { openGitHub("https://github.com/Lin0u0/Weibo/tree/feature/vibo") }) {
-                Text("GitHub 主页")
+            val links: @Composable (Modifier) -> Unit = { modifier ->
+                Column(modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+                    TextButton(onClick = {
+                        val uri = Uri.parse("https://github.com/Lin0u0/Weibo/tree/feature/vibo")
+                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                            .onFailure { updateMessage = "无法打开浏览器" }
+                    }) {
+                        Text("GitHub 主页")
+                    }
+                    updateMessage?.let {
+                        Text(
+                            it,
+                            Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
-        }
-        updateMessage?.let {
-            Text(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        }
-        }
+            if (asDetail) {
+                links(Modifier)
+            } else {
+                AnimatedVisibility(
+                    visibleState = expansion,
+                    enter = settingsExpandEnter(),
+                    exit = settingsExpandExit(),
+                ) {
+                    links(Modifier.bringIntoViewRequester(actionsBringIntoView).onSizeChanged { actionsSize = it })
+                }
+            }
         }
     }
 }
@@ -25995,7 +26311,7 @@ internal fun SettingsAboutCard(versionName: String, bottomContentPadding: Dp) {
 private fun SettingsHelpContent() {
     SettingsList(topContentPadding = 4.dp) {
         appHelpSections.forEach { section ->
-            item {
+            item(key = section.title) {
                 SettingsHelpSectionCard(section = section)
             }
         }
@@ -26013,6 +26329,7 @@ private fun SettingsHelpSectionCard(section: HelpSection) {
         ) {
             Text(
                 text = section.title,
+                modifier = Modifier.semantics { heading() },
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
             )
@@ -26172,11 +26489,12 @@ private fun SettingsCacheCard() {
     val scope = rememberCoroutineScope()
     val clearAction = LocalAppCacheClearAction.current ?: return
     val showMessage = LocalUiMessenger.current
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
     var sizes by remember { mutableStateOf<AppCacheSizes?>(null) }
     var scanning by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf<String?>(null) }
-    var resultText by remember { mutableStateOf<String?>(null) }
+    var resultText by rememberSaveable { mutableStateOf<String?>(null) }
+    var revealRequested by remember { mutableStateOf(false) }
     val reveal = remember { BringIntoViewRequester() }
     var expandedHeight by remember { mutableIntStateOf(0) }
 
@@ -26192,10 +26510,13 @@ private fun SettingsCacheCard() {
             resultText = "暂时无法统计缓存，请重试"
         }
     }
-    LaunchedEffect(expanded, expandedHeight) {
-        if (expanded && expandedHeight > 0) {
+    val expansion = remember { MutableTransitionState(expanded) }
+    expansion.targetState = expanded
+    LaunchedEffect(revealRequested, expansion.isIdle, expandedHeight) {
+        if (revealRequested && expansion.isIdle && expandedHeight > 0) {
             withFrameNanos { }
             reveal.bringIntoView()
+            revealRequested = false
         }
     }
     fun clear(category: AppCacheCategory?) {
@@ -26219,7 +26540,10 @@ private fun SettingsCacheCard() {
     SettingsPlainCard {
         Column {
             Row(
-                Modifier.fillMaxWidth().clickable { expanded = !expanded }
+                Modifier.fillMaxWidth().clickable {
+                    expanded = !expanded
+                    revealRequested = expanded
+                }
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -26234,26 +26558,32 @@ private fun SettingsCacheCard() {
                 }
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
-            if (expanded) Column(
-                Modifier.fillMaxWidth().bringIntoViewRequester(reveal)
-                    .onSizeChanged { expandedHeight = it.height }.padding(horizontal = 16.dp, vertical = 4.dp),
+            AnimatedVisibility(
+                visibleState = expansion,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
             ) {
-                AppCacheCategory.entries.forEach { category ->
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(category.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        Text(sizes?.let { formatCacheBytes(it[category]) } ?: "—", style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        TextButton(onClick = { clear(category) }, enabled = busy == null && !scanning && (sizes?.get(category) ?: 0) > 0) {
-                            Text(if (busy == category.label) "清理中…" else "清理")
+                Column(
+                    Modifier.fillMaxWidth().bringIntoViewRequester(reveal)
+                        .onSizeChanged { expandedHeight = it.height }.padding(horizontal = 16.dp, vertical = 4.dp),
+                ) {
+                    AppCacheCategory.entries.forEach { category ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(category.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                            Text(sizes?.let { formatCacheBytes(it[category]) } ?: "—", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            TextButton(onClick = { clear(category) }, enabled = busy == null && !scanning && (sizes?.get(category) ?: 0) > 0) {
+                                Text(if (busy == category.label) "清理中…" else "清理")
+                            }
                         }
                     }
-                }
-                Text("应用启动或初始化视频缓存时，若缓存目录超过 1GB，会自动清理缓存。不删除账号、草稿、设置和已保存到相册的文件；手动清理时，正在写入及近期分享的临时文件可能保留。",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                resultText?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { clear(null) }, enabled = busy == null && !scanning && (sizes?.total ?: 0) > 0) {
-                        Text(if (busy == "全部缓存") "清理中…" else "清理全部")
+                    Text("应用启动或初始化视频缓存时，若缓存目录超过 1GB，会自动清理缓存。不删除账号、草稿、设置和已保存到相册的文件；手动清理时，正在写入及近期分享的临时文件可能保留。",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    resultText?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { clear(null) }, enabled = busy == null && !scanning && (sizes?.total ?: 0) > 0) {
+                            Text(if (busy == "全部缓存") "清理中…" else "清理全部")
+                        }
                     }
                 }
             }
@@ -26321,7 +26651,11 @@ private fun SettingsImageCard(
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
 
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -26514,7 +26848,11 @@ private fun SettingsTypographyCard(
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
 
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -26769,7 +27107,11 @@ private fun SettingsAppearanceCard(
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
 
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -26870,7 +27212,11 @@ private fun SettingsThemeColorCard(
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
 
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -26949,7 +27295,7 @@ private fun SettingsBottomBarGlassCard(
     onGlassChange: (Float) -> Unit,
     onGlassCommit: () -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
     SettingsPlainCard {
         Column(Modifier.fillMaxWidth()) {
             Row(
@@ -26960,19 +27306,23 @@ private fun SettingsBottomBarGlassCard(
             ) {
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text(
-                        text = "底栏 Liquid Glass",
+                        text = "液态玻璃",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = "展开调整底栏磨砂和玻璃效果",
+                        text = "也应用于视频播放器控件",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
                     SettingsGlassSlider("磨砂效果", frostAmount, onFrostChange, onFrostCommit, "透明", "磨砂")
                     Spacer(Modifier.height(14.dp))
@@ -27108,7 +27458,7 @@ private fun SettingsExpandIndicator(
 ) {
     val rotation by animateFloatAsState(
         targetValue = if (rotateOnExpand && expanded) 180f else 0f,
-        animationSpec = tween(200),
+        animationSpec = tween(SettingsMotionMillis),
         label = "settings_expand_chevron",
     )
     Icon(
@@ -27190,7 +27540,11 @@ private fun SettingsAccountCard(
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
 
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -27322,7 +27676,11 @@ private fun SettingsEmoticonCard(
                 }
             }
 
-            AnimatedVisibility(visible = expanded) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = settingsExpandEnter(),
+                exit = settingsExpandExit(),
+            ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()

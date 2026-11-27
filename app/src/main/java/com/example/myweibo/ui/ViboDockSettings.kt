@@ -72,6 +72,7 @@ fun ViboDockSettings(
     onPreferencesChange: (ViboDockPreferences) -> Unit,
     modifier: Modifier = Modifier,
     catalogue: List<ViboDockEntry> = viboDockCatalogue(null, emptyList()),
+    showTitle: Boolean = true,
     preview: @Composable (ViboDockPreferences, Modifier) -> Unit = { config, previewModifier ->
         DockPreview(config.orderedVisibleEntries(catalogue), config.showLabels, previewModifier)
     },
@@ -96,11 +97,13 @@ fun ViboDockSettings(
         modifier.fillMaxWidth().testTag("vibo_dock_settings"),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text(
-            text = stringResource(R.string.vibo_dock_title),
-            modifier = Modifier.semantics { heading() },
-            style = MaterialTheme.typography.titleLarge,
-        )
+        if (showTitle) {
+            Text(
+                text = stringResource(R.string.vibo_dock_title),
+                modifier = Modifier.semantics { heading() },
+                style = MaterialTheme.typography.titleLarge,
+            )
+        }
         Surface(
             modifier = Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.large,

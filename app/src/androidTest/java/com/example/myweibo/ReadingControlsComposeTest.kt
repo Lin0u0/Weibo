@@ -33,10 +33,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasAnyAncestor
@@ -589,6 +592,69 @@ class ReadingControlsComposeTest {
     }
 
     @Test
+    fun realTimelineRailCountsN3N2N1RR2WithoutDoubleCountingTheCollapsedBlock() {
+        val n3 = fixturePost(15).copy(text = "N3")
+        val n2 = fixturePost(14).copy(text = "N2")
+        val n1 = fixturePost(13).copy(text = "N1")
+        val r = fixturePost(12).copy(text = "R")
+        val r2 = fixturePost(11).copy(text = "R2")
+        val previous = listOf(r, r2) + (10 downTo 1).map(::fixturePost)
+        lateinit var state: LazyListState
+        lateinit var timeline: HomeTimelineReadingState
+        // Scroll past the 12dp of content padding left below the status bar.
+        val topClearance = with(compose.density) { 16.dp.roundToPx() }
+        setFixture {
+            val list = rememberLazyListState()
+            val reading = rememberFixtureHomeTimeline(previous, preferences = ReadingPreferences(reverseReading = true, newPostLimit = 1))
+            SideEffect { state = list; timeline = reading }
+            FixtureHomeTimeline(list, reading)
+        }
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val rail = compose.onNode(SemanticsMatcher.keyIsDefined(SemanticsActions.ScrollToIndex))
+        fun assertAbove(count: Int) {
+            val label = context.getString(R.string.feed_scroll_posts_above, count)
+            rail.assertIsDisplayed().assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, label))
+        }
+        assertAbove(0)
+        compose.runOnIdle {
+            timeline.seedFixtureReadingAnchor(r)
+            timeline.publishRefresh(
+                TimelinePage(listOf(n3, n2, n1, r)), state, protectViewport = true, keepReading = true,
+            )
+        }
+        compose.runOnIdle {
+            assertEquals(2, timeline.feedProjection.gap?.hiddenPostCount)
+            assertEquals(1, timeline.feedProjection.dividerIndex)
+            // Scroll after the refreshed projection has been laid out, not against the old index map.
+            state.requestScrollToItem(1, topClearance)
+        }
+        assertAbove(1)
+        compose.runOnIdle { state.requestScrollToItem(2, topClearance) } // R; divider fully above.
+        assertAbove(3)
+        compose.runOnIdle { state.requestScrollToItem(1, topClearance) } // Back up to the divider.
+        assertAbove(1)
+        val rOffset = compose.runOnIdle {
+            assertEquals(1, state.firstVisibleItemIndex)
+            assertEquals(topClearance, state.firstVisibleItemScrollOffset)
+            state.layoutInfo.visibleItemsInfo.single { it.key == r.id }.offset
+        }
+        val collapsed = context.getString(R.string.feed_reverse_browse_gap_collapsed)
+        compose.onNode(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, collapsed)).performClick()
+        compose.runOnIdle {
+            val rows = state.layoutInfo.visibleItemsInfo
+            val rIndex = rows.indexOfFirst { it.key == r.id }
+            assertEquals(rOffset, rows.getOrNull(rIndex)?.offset)
+            assertEquals(n1.id, rows.getOrNull(rIndex - 1)?.key)
+            state.requestScrollToItem(2, topClearance) // Expanded N2 is still visible.
+        }
+        assertAbove(1)
+        compose.runOnIdle { state.requestScrollToItem(4, topClearance) } // Expanded R.
+        assertAbove(3)
+        compose.runOnIdle { timeline.items = timeline.items + fixturePost(0) }
+        assertAbove(3)
+    }
+
+    @Test
     fun closingAndReopeningReverseReadingGapKeepsExpansionInItsHiddenRows() {
         val previous = (10 downTo 1).map(::fixturePost)
         val hidden = fixturePost(11).copy(text = NavigationBody)
@@ -605,12 +671,14 @@ class ReadingControlsComposeTest {
         }
         val body = cardText(NavigationBody, substring = false)
         compose.runOnIdle {
+            timeline.seedFixtureReadingAnchor(previous.first())
             timeline.publishRefresh(TimelinePage(listOf(newest, hidden)), listState, protectViewport = true, keepReading = true)
         }
-        body.assertDoesNotExist()
+        body.assertIsNotDisplayed()
         compose.runOnIdle {
             assertEquals(1, timeline.feedProjection.gap?.hiddenPostCount)
-            timeline.toggleTimelineGap()
+            assertTrue(timeline.feedProjection.visibleItems.none { it.id == hidden.id })
+            timeline.toggleTimelineGap(listState)
         }
         compose.runOnIdle {
             val projection = timeline.feedProjection
@@ -618,14 +686,15 @@ class ReadingControlsComposeTest {
         }
         cardToggle(quoted = false).performClick()
         body.assertLayout(5, false, TextOverflow.Clip)
-        compose.runOnIdle { timeline.toggleTimelineGap() }
-        body.assertDoesNotExist()
+        compose.runOnIdle { timeline.toggleTimelineGap(listState) }
+        body.assertIsNotDisplayed()
         compose.runOnIdle {
+            assertTrue(timeline.feedProjection.visibleItems.none { it.id == hidden.id })
             assertTrue(timeline.items.any { it.id == hidden.id })
             assertTrue(timeline.longPostController(listState).isExpanded(HomeLongPostKey(hidden.id)))
             listState.requestScrollToItem(0)
         }
-        compose.runOnIdle { timeline.toggleTimelineGap() }
+        compose.runOnIdle { timeline.toggleTimelineGap(listState) }
         compose.runOnIdle {
             val projection = timeline.feedProjection
             listState.requestScrollToItem(projection.lazyIndexOfPost(projection.visibleItems.indexOfFirst { it.id == hidden.id }))
@@ -1078,7 +1147,7 @@ class ReadingControlsComposeTest {
                 assertEquals(expectedKeepReading, keepReading)
                 timeline.publishRefresh(TimelinePage(listOf(refreshed), nextCursor = "new-page"), listState, protectViewport, keepReading)
                 assertEquals(if (keepReading) posts.map { it.id } else listOf(post.id), timeline.items.map { it.id })
-                assertEquals(post.id.takeIf { keepReading }, timeline.reverseBrowsePreviousHeadId)
+                assertNull(timeline.readingBoundaryLazyIndex) // Refresh alone never establishes read progress.
                 assertEquals("new-page".takeUnless { keepReading }, timeline.nextCursor)
             }
             compose.mainClock.advanceTimeByFrame()
@@ -1215,6 +1284,14 @@ class ReadingControlsComposeTest {
                 items = posts
             }
         }
+    }
+
+    private fun HomeTimelineReadingState.seedFixtureReadingAnchor(row: FeedItem) {
+        val account = "123"
+        timelineCacheAccountId = account
+        acceptReadingRows(account, chronological = true)
+        markReadingRowsViewed(requireNotNull(readingScope), setOf(row.id))
+        assertEquals(row.id, readingAnchor?.rowId)
     }
 
     @Composable

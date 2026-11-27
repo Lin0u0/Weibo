@@ -6,9 +6,11 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.util.LruCache
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.indication
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -21,14 +23,17 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.MotionDurationScale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -47,11 +52,14 @@ import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.StoredWeiboAccount
 import com.example.myweibo.data.UserProfile
 import com.example.myweibo.data.ViboDockEntry
+import com.example.myweibo.data.normalizeBottomBarGlassAmount
 import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
 import com.example.myweibo.ui.theme.isAppLightTheme
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.emptyBackdrop
+import com.kyant.backdrop.isRenderEffectSupported
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
 
 internal data class ViboDockAvatarRequest(val accountId: String, val url: String)
@@ -127,11 +135,22 @@ private fun ViboDockAvatarEndcap(
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val focused by interactionSource.collectIsFocusedAsState()
-    val pressProgress by animateFloatAsState(
-        targetValue = if (pressed) 1f else 0f,
-        animationSpec = spring(dampingRatio = 0.8f, stiffness = 700f),
-        label = "dock-avatar-press",
-    )
+    val isLightTheme = isAppLightTheme()
+    val selectionTint = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+    var motionEnabled by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        val motionScale = coroutineContext[MotionDurationScale]
+        snapshotFlow { motionScale?.scaleFactor != 0f }.collect { motionEnabled = it }
+    }
+    val pressScale = if (motionEnabled) {
+        animateFloatAsState(
+            targetValue = if (pressed) 0.96f else 1f,
+            animationSpec = tween(durationMillis = if (pressed) 90 else 140),
+            label = "dock-avatar-press",
+        )
+    } else {
+        null
+    }
 
     Box(
         modifier = modifier.size(56.dp)
@@ -139,38 +158,34 @@ private fun ViboDockAvatarEndcap(
             .selectable(
                 selected = selected,
                 interactionSource = interactionSource,
-                indication = null,
+                indication = null, // The ripple belongs to the visual circle, not the hit box.
                 role = Role.Tab,
                 onClick = onClick,
             ),
         contentAlignment = Alignment.Center,
     ) {
-        if (avatar != null) {
-            Image(
-                bitmap = avatar,
-                contentDescription = null,
-                modifier = Modifier.size(44.dp)
-                    .graphicsLayer {
-                        val scale = 1f + 0.12f * pressProgress
-                        scaleX = scale
-                        scaleY = scale
-                    }
-                    .clip(CircleShape)
-                    .testTag("vibo_dock_avatar_image"),
-                contentScale = ContentScale.Crop,
-            )
-        } else {
-            Box(
-                modifier = Modifier.matchParentSize()
-                    .graphicsLayer {
-                        val scale = 1f + 0.06f * pressProgress
-                        scaleX = scale
-                        scaleY = scale
-                    }
-                    .drawBottomBarGlassBackdrop(backdrop, frostAmount, glassAmount, isAppLightTheme())
-                    .testTag("vibo_dock_avatar_glass"),
-                contentAlignment = Alignment.Center,
-            ) {
+        Box(
+            modifier = Modifier.matchParentSize()
+                .graphicsLayer {
+                    val scale = pressScale?.value ?: 1f
+                    scaleX = scale
+                    scaleY = scale
+                }
+                .drawViboDockEndcapSurface(backdrop, frostAmount, glassAmount, isLightTheme)
+                .clip(CircleShape)
+                .then(if (selected) Modifier.background(selectionTint) else Modifier)
+                .indication(interactionSource, ripple(color = contentColor))
+                .testTag("vibo_dock_avatar_glass"),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (avatar != null) {
+                Image(
+                    bitmap = avatar,
+                    contentDescription = null,
+                    modifier = Modifier.size(42.dp).clip(CircleShape).testTag("vibo_dock_avatar_image"),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
                 Icon(
                     painter = painterResource(ViboDockEntry.Profile.iconRes),
                     contentDescription = null,
@@ -178,11 +193,26 @@ private fun ViboDockAvatarEndcap(
                     tint = contentColor,
                 )
             }
-        }
-        if (focused) {
-            Box(Modifier.matchParentSize().padding(2.dp).border(2.dp, contentColor, CircleShape))
+            if (focused) {
+                Box(Modifier.matchParentSize().padding(2.dp).border(2.dp, contentColor, CircleShape))
+            }
         }
     }
+}
+
+/** One background for either Vibo endcap, independent of the icon or photo it hosts. */
+internal fun Modifier.drawViboDockEndcapSurface(
+    backdrop: Backdrop,
+    frostAmount: Float,
+    glassAmount: Float,
+    isLightTheme: Boolean,
+): Modifier = if (
+    isRenderEffectSupported() && backdrop !== emptyBackdrop() &&
+    (normalizeBottomBarGlassAmount(frostAmount) > 0f || normalizeBottomBarGlassAmount(glassAmount) > 0f)
+) {
+    drawBottomBarGlassBackdrop(backdrop, frostAmount, glassAmount, isLightTheme)
+} else {
+    background(if (isLightTheme) Color.White else Color(0xFF121212), CircleShape)
 }
 
 private const val DockAvatarDecodeSize = 192

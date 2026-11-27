@@ -1,5 +1,6 @@
 package com.example.myweibo.ui
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -34,17 +35,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -55,7 +56,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -66,8 +66,8 @@ import com.example.myweibo.data.ViboDockPreferences
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.LiquidDockSearchButton
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabCoverage
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabPressProgress
+import com.example.myweibo.ui.liquidglass.ViboTimelinePickerReveal
+import com.example.myweibo.ui.liquidglass.dockSelectionTween
 import com.example.myweibo.ui.theme.isAppLightTheme
 import com.kyant.backdrop.Backdrop
 import kotlin.math.roundToInt
@@ -84,6 +84,7 @@ internal data class ViboDockRuntime(
     val onEntrySelected: (ViboDockEntry) -> Unit,
     val profileAvatar: ViboDockAvatarRequest?,
     val onEntryDoubleClick: ((ViboDockEntry) -> Unit)? = null,
+    val onSelectedTimelineClick: (() -> Unit)? = null,
 )
 
 @Composable
@@ -132,6 +133,9 @@ internal fun WeiboLiquidBottomBar(
         ?: homeIndex.takeIf { it >= 0 }
         ?: visibleTimelineIndex?.takeIf { selectedTab == MainTab.Feed }
         ?: firstTimelineIndex
+    LaunchedEffect(timelineMenuExpanded) {
+        if (!timelineMenuExpanded) menuAnchorEntryId = null
+    }
     LaunchedEffect(menuAnchorIndex, timelineMenuExpanded) {
         if (menuAnchorIndex < 0 && timelineMenuExpanded) onTimelineMenuExpandedChange(false)
     }
@@ -183,7 +187,9 @@ internal fun WeiboLiquidBottomBar(
             homeLabel = homeLabel,
             onEntrySelected = { entry ->
                 if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
-                if (dockRuntime != null && entry.isTimelineShortcut()) {
+                if (entry.isTimelineSlot() && entry.id == entryIds.getOrNull(selectedIndex) && dockRuntime?.onSelectedTimelineClick != null) {
+                    dockRuntime.onSelectedTimelineClick.invoke()
+                } else if (dockRuntime != null && entry.isTimelineShortcut()) {
                     dockRuntime.onEntrySelected(entry)
                 } else {
                     onTabChange(entry.toMainTab())
@@ -195,10 +201,15 @@ internal fun WeiboLiquidBottomBar(
             },
             onTimelineDoubleClick = dockRuntime?.onEntryDoubleClick?.let { refresh ->
                 { entry ->
-                    if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
-                    refresh(entry)
+                    // Consume both taps on timeline slots, but a reselect-enabled dock only
+                    // refreshes its active route, including when represented by the Home alias.
+                    if (dockRuntime?.onSelectedTimelineClick == null || entry.id == entryIds.getOrNull(selectedIndex)) {
+                        if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
+                        refresh(entry)
+                    }
                 }
             },
+            hasTimelineReselect = dockRuntime?.onSelectedTimelineClick != null,
             onTimelineLongPress = { entry ->
                 menuAnchorEntryId = entry.id
                 onTimelineMenuExpandedChange(true)
@@ -228,25 +239,17 @@ internal fun WeiboLiquidBottomBar(
                 .roundToInt()
                 .coerceIn(0, (dockWidth - menuWidth).roundToPx().coerceAtLeast(0))
         }
-        val layoutDirection = LocalLayoutDirection.current
-        val timelineMenuOrigin = with(density) {
-            val startRelativeX = menuAnchorCenterInDock - timelineMenuOffsetX
-            val physicalX = if (layoutDirection == LayoutDirection.Ltr) startRelativeX else menuWidth.toPx() - startRelativeX
-            Offset(physicalX, timelineMenuHeight.toPx())
-        }
-        ActionMenuReveal(
-            visible = timelineMenuExpanded && menuAnchorIndex >= 0 && availableCapsuleWidth > 0.dp,
-            menuWidth = menuWidth,
-            menuHeight = timelineMenuHeight,
-            originInMenu = timelineMenuOrigin,
-            onExitComplete = { menuAnchorEntryId = null },
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .offset { IntOffset(timelineMenuOffsetX, -(DockHeight + timelineMenuGap).roundToPx()) }
-                .zIndex(50f)
-                .graphicsLayer { clip = false },
-        ) {
-            timelineMenuContent { onTimelineMenuExpandedChange(false) }
+        if (timelineMenuExpanded && menuAnchorIndex >= 0 && availableCapsuleWidth > 0.dp) {
+            ViboTimelinePickerReveal(
+                // Don't lower the entering menu into the dock's input area.
+                lift = minOf(timelineMenuGap, timelineMenuHeight, 8.dp).coerceAtLeast(0.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .offset { IntOffset(timelineMenuOffsetX, -(DockHeight + timelineMenuGap).roundToPx()) }
+                    .zIndex(50f),
+            ) {
+                timelineMenuContent { onTimelineMenuExpandedChange(false) }
+            }
         }
     }
 }
@@ -261,6 +264,7 @@ private fun ViboDock(
     onEntrySelected: (ViboDockEntry) -> Unit,
     onEndcapSelected: (MainTab) -> Unit,
     onTimelineDoubleClick: ((ViboDockEntry) -> Unit)?,
+    hasTimelineReselect: Boolean,
     onTimelineLongPress: (ViboDockEntry) -> Unit,
     showLabels: Boolean,
     unreadMessagesCount: Int,
@@ -308,7 +312,6 @@ private fun ViboDock(
                         selectedTabIndex = { selectedIndex },
                         onTabSelected = { index -> onEntrySelected(entries[index]) },
                         backdrop = backdrop,
-                        accentColor = accentColor,
                         frostAmount = frostAmount,
                         glassAmount = glassAmount,
                         forceDarkSurface = darkSurfaceOverride,
@@ -321,32 +324,35 @@ private fun ViboDock(
                         dragSelectionEnabled = !scrollable,
                         modifier = Modifier.width(capsuleWidth),
                     ) {
-                        val tabCoverage = LocalLiquidBottomTabCoverage.current
-                        val pressProgress = LocalLiquidBottomTabPressProgress.current
                         entries.forEachIndexed { index, entry ->
-                            val coverage = tabCoverage(index)
                             val isHome = entry.id == ViboDockEntry.Home.id
                             val unread = if (entry.id == ViboDockEntry.Messages.id) unreadMessagesCount else 0
                             LiquidBottomTab(
                                 selected = index == selectedIndex,
+                                dockIndex = index,
                                 onClick = { onEntrySelected(entry) },
                                 onLongClick = if (entry.isTimelineSlot()) ({ onTimelineLongPress(entry) }) else null,
                                 onDoubleClick = onTimelineDoubleClick?.takeIf { scrollable && entry.isTimelineSlot() }
                                     ?.let { callback -> { callback(entry) } },
                                 modifier = Modifier.semantics {
                                     contentDescription = entry.title
+                                    if (hasTimelineReselect && index == selectedIndex && entry.isTimelineSlot()) {
+                                        onClick(label = "回到已读位置") { onEntrySelected(entry); true }
+                                        onTimelineDoubleClick?.let { refresh ->
+                                            customActions = listOf(CustomAccessibilityAction("刷新时间线") { refresh(entry); true })
+                                        }
+                                    }
                                     if (isHome && homeLabel != entry.title) stateDescription = homeLabel
                                     if (unread > 0) stateDescription = "$unread 条未读消息"
                                 },
                             ) {
+                                val color by animateColorAsState(
+                                    targetValue = if (index == selectedIndex) accentColor else contentColor,
+                                    animationSpec = dockSelectionTween(),
+                                    label = "dock-tab-color",
+                                )
                                 Box(
-                                    modifier = Modifier
-                                        .size(if (showLabels) 32.dp else 36.dp)
-                                        .graphicsLayer {
-                                            val scale = 1f + 0.2f * pressProgress * coverage
-                                            scaleX = scale
-                                            scaleY = scale
-                                        },
+                                    modifier = Modifier.size(if (showLabels) 32.dp else 36.dp),
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     if (unread > 0) {
@@ -355,18 +361,17 @@ private fun ViboDock(
                                                 Text(if (unread > 99) "99+" else unread.toString())
                                             }
                                         }) {
-                                            ViboDockEntryGlyph(entry, contentColor)
+                                            ViboDockEntryGlyph(entry, color)
                                         }
                                     } else {
-                                        ViboDockEntryGlyph(entry, contentColor)
+                                        ViboDockEntryGlyph(entry, color)
                                     }
                                 }
                                 if (showLabels) {
                                     DockLabel(
                                         label = if (isHome) homeLabel else entry.title,
                                         fallback = if (isHome) entry.title else null,
-                                        color = contentColor,
-                                        emphasized = coverage > 0.5f,
+                                        color = color,
                                     )
                                 }
                             }
@@ -390,22 +395,25 @@ private fun ViboDock(
 }
 
 @Composable
-private fun DockLabel(label: String, fallback: String?, color: Color, emphasized: Boolean) {
+private fun DockLabel(label: String, fallback: String?, color: Color) {
     val style = LocalTextStyle.current.copy(
         fontSize = 10.sp,
         lineHeight = 12.sp,
-        fontWeight = if (emphasized) FontWeight.SemiBold else FontWeight.Normal,
+        fontWeight = FontWeight.Normal,
     )
     BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 2.dp)) {
         val measurer = rememberTextMeasurer()
-        val displayLabel = if (fallback != null && label != fallback && measurer.measure(
-                text = label,
-                style = style,
-                maxLines = 1,
-                softWrap = false,
-                constraints = Constraints(maxWidth = constraints.maxWidth),
-            ).hasVisualOverflow
-        ) fallback else label
+        val maxWidth = constraints.maxWidth
+        val displayLabel = remember(label, fallback, measurer, style, maxWidth) {
+            if (fallback != null && label != fallback && measurer.measure(
+                    text = label,
+                    style = style,
+                    maxLines = 1,
+                    softWrap = false,
+                    constraints = Constraints(maxWidth = maxWidth),
+                ).hasVisualOverflow
+            ) fallback else label
+        }
         Text(
             text = displayLabel,
             modifier = Modifier.align(Alignment.Center).clearAndSetSemantics { },

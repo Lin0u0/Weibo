@@ -7,4 +7,5 @@
     <string name="feed_reverse_browse_gap_collapse">收起微博</string>
     <string name="feed_reverse_browse_gap_expanded">已展开</string>
     <string name="feed_reverse_browse_gap_collapsed">已折叠</string>
+    <string name="feed_scroll_posts_above">上方还有 %1$d 条微博</string>
 </resources>

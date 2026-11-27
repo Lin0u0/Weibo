@@ -128,7 +128,7 @@ Vibo 是 [Android_16_Weibo](https://github.com/gaoxipeng/Android_16_Weibo) 的�
 .\gradlew.bat :app:assembleRelease
 ```
 
-输出：`app/build/outputs/apk/release/app-release.apk`。
+Gradle 输出：`app/build/outputs/apk/release/app-release.apk`。每次交付新的测试 APK 时，在 `app/build.gradle.kts` 递增 `versionCode`，并将 `versionName` 更新为 `YYYY.MM.DD.当日序号`；普通构建重试不递增。交付文件名使用 `Vibo-<versionName>.apk`，「关于 Vibo」从已安装的 APK 读取版本号。
 
 Release 是否可安装及能否覆盖旧版本，取决于签名配置。不要使用他人的签名凭据，也不要将私钥上传到 GitHub。
 

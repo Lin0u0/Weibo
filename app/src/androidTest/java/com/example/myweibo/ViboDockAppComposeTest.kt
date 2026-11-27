@@ -69,6 +69,11 @@ class ViboDockAppComposeTest {
         dock(MainTab.Mine).performClick()
         compose.onNodeWithContentDescription("设置").assertIsDisplayed().performClick()
         compose.onNodeWithText("设置").assertIsDisplayed()
+        listOf("阅读", "外观与底栏", "媒体", "账号与关于").forEach { title ->
+            compose.onNodeWithText(title).assertIsDisplayed()
+        }
+        compose.onNodeWithText("外观与底栏").performClick()
+        compose.onNodeWithText("底栏").assertIsDisplayed().performClick()
 
         val messages = "vibo_dock_visibility_MESSAGES"
         settingsControl(messages).assertIsOn().performClick().assertIsOff()
