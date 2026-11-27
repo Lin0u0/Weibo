@@ -4318,7 +4318,7 @@ internal class HomeTimelineReadingState(
     val displayedOrderedRoute: TimelineRefreshRoute? get() = displayedRowsOwner?.takeIf { it == refreshRoute }
     private var confirmedProjection by mutableStateOf<Pair<TimelineRefreshRoute, ConfirmedTimelineRefresh>?>(null)
     private var disconnectedAt = emptySet<TimelineRefreshPostIdentity>()
-    var explicitRefreshVisitGeneration = 0
+    var explicitRefreshVisitGeneration by mutableIntStateOf(0)
         private set
 
     // This describes only the current list's fold, not which posts the user has read.
@@ -4446,7 +4446,6 @@ internal class HomeTimelineReadingState(
         reusePreviousRows: Boolean = true,
         explicitBaseline: ExplicitTimelineRefreshBaseline? = null,
         explicitResponseVerified: Boolean = true,
-        returnToTop: Boolean = false,
     ): Int? {
         val ordered = selectedTimelineGroupId != null || timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle
         val incoming = if (ordered) sortFeedTimelineItems(page.items) else page.items
@@ -4481,15 +4480,10 @@ internal class HomeTimelineReadingState(
             // automatic results cannot silently heal a known disjoint seam either.
             val continuityRows = if (explicitBaseline != null && !explicitResponseVerified) emptyList() else page.items
             reconcileRefreshContinuity(continuityRows, merged, mayHeal = refreshedBatch != null)
-            if (returnToTop && refreshedBatch != null) {
-                protectedNewPostFloor = 0
-            } else if (!returnToTop) {
-                // Coordinate with the live keyed viewport, not the request-time position.
-                listState.retainHomeViewportIfKeyRemoved(projectRefreshPreservingKey(listState, merged))
-            }
+            // Coordinate with the live keyed viewport, not the request-time position.
+            listState.retainHomeViewportIfKeyRemoved(projectRefreshPreservingKey(listState, merged))
             items = merged
             timelineVerifiedFromNetwork = true
-            if (returnToTop) goToTimelineTop(listState)
             // The first-page cursor does not belong to the retained tail.
             return refreshedBatch?.newPosts?.size
         }
@@ -4497,12 +4491,11 @@ internal class HomeTimelineReadingState(
         confirmedProjection = null
         disconnectedAt = emptySet()
         val refreshed = replaceFeedTimelineRefresh(if (reusePreviousRows) items else emptyList(), incoming)
-        if (protectViewport && !returnToTop) {
+        if (protectViewport) {
             listState.retainHomeViewportIfKeyRemoved(FeedTimelineRefreshProjection(refreshed, gap = null))
         }
         items = refreshed
         timelineVerifiedFromNetwork = refreshed.isNotEmpty()
-        if (returnToTop) goToTimelineTop(listState)
         nextCursor = page.nextCursor ?: when (timelineKind) {
             TimelineKind.SpecialFollowing, TimelineKind.FriendsCircle -> page.items.lastOrNull()?.id
             else -> null
@@ -6565,7 +6558,6 @@ fun WeiboApp() {
     fun refreshTimeline(
         showRefreshHint: Boolean = true,
         explicitUserRefresh: Boolean = false,
-        returnToTop: Boolean = false,
     ) {
         homeTimeline.feedRefreshHint = null
         homeTimeline.timelineRefreshJob?.cancel()
@@ -6586,7 +6578,7 @@ fun WeiboApp() {
         val refreshVisitGeneration = homeTimeline.explicitRefreshVisitGeneration
         fun refreshVisitIsCurrent() = selectedTab == MainTab.Feed &&
             refreshVisitGeneration == homeTimeline.explicitRefreshVisitGeneration
-        val startedAtTop = returnToTop || feedListState.isAtHomeTimelineTop()
+        val startedAtTop = feedListState.isAtHomeTimelineTop()
         val startedOrdered = requestedKind.hasOrderedRefresh(requestedGroupId, previousItems)
         val explicitOwner = if (explicitUserRefresh) {
             homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
@@ -6635,10 +6627,9 @@ fun WeiboApp() {
                         val sameVerifiedBaseline = verifiedOwner != null && previousOrderedOwner?.accountId == verifiedOwner &&
                             previousOrderedOwner == homeTimeline.displayedOrderedRoute
                         val newCount = countNewTimelinePosts(previousItems, page.items, ordered = orderedResponse && startedOrdered)
-                        val applyAtTop = returnToTop && refreshVisitIsCurrent()
                         // Ordered routes show this hint only when a manual refresh confirms zero new posts.
                         val legacyNoNewAtTop = showRefreshHint && explicitUserRefresh && newCount == 0 &&
-                            !startedOrdered && !orderedResponse && startedAtTop && (applyAtTop || feedListState.isAtHomeTimelineTop())
+                            !startedOrdered && !orderedResponse && startedAtTop && feedListState.isAtHomeTimelineTop()
                         val protectViewport = preserveViewport && homeTimeline.items.isNotEmpty()
                         // Prefer retaining same-owner history even when the explicit result cannot
                         // establish a batch. A ranked or unverified response cannot merge an owned tail.
@@ -6661,10 +6652,9 @@ fun WeiboApp() {
                             reusePreviousRows = verifiedOwner == null || sameVerifiedBaseline,
                             explicitBaseline = explicitBaseline?.takeIf { selectedTab == MainTab.Feed && sameVerifiedBaseline },
                             explicitResponseVerified = explicitResponseVerified,
-                            returnToTop = applyAtTop,
                         )
                         val noNewAtTop = legacyNoNewAtTop ||
-                            (rolloverCount == 0 && startedAtTop && (applyAtTop || feedListState.isAtHomeTimelineTop()))
+                            (rolloverCount == 0 && startedAtTop && feedListState.isAtHomeTimelineTop())
                         homeTimeline.acceptOrderedRows(verifiedOwner, orderedResponse && homeTimeline.items.isNotEmpty() &&
                             requestedKind.hasOrderedRefresh(requestedGroupId, homeTimeline.items))
                         if (page.items.isNotEmpty() || !keepReading) preservedFeedSourceItem = null
@@ -6708,7 +6698,7 @@ fun WeiboApp() {
                         } else if (showRefreshHint && refreshHintGeneration == homeTimeline.feedRefreshHintGeneration) {
                             homeTimeline.feedRefreshHint = when {
                                 noNewAtTop && refreshVisitIsCurrent() &&
-                                    (applyAtTop || feedListState.isAtHomeTimelineTop()) -> FeedNoNewPostsHint
+                                    feedListState.isAtHomeTimelineTop() -> FeedNoNewPostsHint
                                 !protectViewport && newCount != null && newCount > 0 -> "更新了 $newCount 条微博"
                                 else -> null
                             }
@@ -10563,8 +10553,8 @@ fun WeiboApp() {
                         onEntryDoubleClick = {
                             bottomBarVisible = true
                             bottomBarScrollDistance[0] = 0f
-                            homeTimeline.goToTimelineTopAndRefresh(feedListState) {
-                                refreshTimeline(explicitUserRefresh = true, returnToTop = true)
+                            homeTimeline.goToTimelineTopAndRefresh(feedListState, scope) {
+                                refreshTimeline(explicitUserRefresh = true)
                             }
                         },
                         profileAvatar = resolveViboDockAvatarRequest(

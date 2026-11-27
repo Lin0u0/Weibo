@@ -130,7 +130,7 @@ class ViboReadingUpgradeComposeTest {
             val baseline = requireNotNull(timeline.captureExplicitRefreshBaseline(owner))
             assertEquals(2, timeline.publishRefresh(
                 TimelinePage(listOf(post(26), post(25), rows.first())), scroll,
-                protectViewport = true, keepReading = true, explicitBaseline = baseline, returnToTop = true,
+                protectViewport = true, keepReading = true, explicitBaseline = baseline,
             ))
             assertEquals(1, timeline.feedProjection.gap?.hiddenPostCount)
         }

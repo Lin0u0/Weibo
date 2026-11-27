@@ -12,6 +12,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,10 +27,12 @@ import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.doubleClick
 import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -54,7 +57,12 @@ import com.example.myweibo.ui.goToTimelineTop
 import com.example.myweibo.ui.goToTimelineTopAndRefresh
 import com.kyant.backdrop.backdrops.emptyBackdrop
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -176,7 +184,7 @@ class ReverseHomeReselectComposeTest {
         folded.assertDoesNotExist()
     }
 
-    @Test fun selectedDoubleFromMidListRefreshesOnceAndStaysAtNewTopWhenResultArrives() {
+    @Test fun selectedDoubleLandsOnOldTopBeforeOneRefreshAndKeepsItAfterPrepend() {
         val fixture = mount(newPostLimit = 1)
         fixture.publish(newCount = 2)
         fixture.scrollTo(index = 12, offset = 19)
@@ -185,20 +193,96 @@ class ReverseHomeReselectComposeTest {
         compose.runOnIdle {
             assertEquals(1, fixture.topJumps.get())
             assertEquals(1, fixture.refreshes)
+            // Recorded inside the request callback, before delivering any response.
+            assertEquals(post(26).id to 0, fixture.dockRefreshStart)
+            assertTrue(fixture.timeline.isLoading)
             assertEquals(1, fixture.timeline.feedProjection.gap?.hiddenPostCount)
+            assertEquals((26 downTo 1).map(::post), fixture.timeline.items)
         }
 
-        // Moving while the response is pending must not let a stale viewport anchor
-        // win over the explicit return-to-top when the new page is applied.
-        fixture.scrollTo(index = 12, offset = 15)
         fixture.finishDockRefresh(Result.success(TimelinePage((29 downTo 26).map(::post))))
-        fixture.assertAtRow(index = 0, postNumber = 29)
+        // Lazy rows are 29, divider, 26, ... (28 and 27 are hidden by the fold).
+        fixture.assertAtRow(index = 2, postNumber = 26)
         compose.runOnIdle {
             assertEquals(1, fixture.refreshes)
+            assertTrue(fixture.listState.canScrollBackward)
             assertEquals(2, fixture.timeline.feedProjection.gap?.hiddenPostCount)
+            assertEquals(1, fixture.timeline.feedProjection.dividerIndex)
             assertEquals((29 downTo 1).map(::post), fixture.timeline.items)
             assertNull(fixture.timeline.feedRefreshHint)
         }
+
+        fixture.scrollPastPaddingAtPost(26)
+        fixture.assertRailCount(3) // One visible new post plus the two folded new posts.
+        val feed = compose.onNode(hasScrollToIndexAction())
+        feed.performScrollToIndex(0)
+        fixture.assertAtRow(index = 0, postNumber = 29)
+        compose.onNodeWithText(post(29).text).assertIsDisplayed()
+        feed.performScrollToIndex(1)
+        compose.onNodeWithText(label(R.string.feed_reverse_browse_gap, 2)).assertIsDisplayed()
+        compose.runOnIdle { assertEquals(1, fixture.refreshes) }
+    }
+
+    @Test fun selectedDoubleAtMeasuredHeadDoesNotRequestAnotherJump() {
+        val fixture = mount()
+        fixture.assertAtRow(index = 0, postNumber = 24)
+        home().assertIsSelected().performTouchInput { doubleClick() }
+        compose.runOnIdle {
+            assertEquals(post(24).id to 0, fixture.dockRefreshStart)
+            assertEquals(1, fixture.refreshes)
+            // A real top jump suppresses layout paging; staying on the measured head does not.
+            assertFalse(fixture.timeline.longPostController(fixture.listState).isLayoutPagingSuppressed)
+        }
+        fixture.finishDockRefresh(Result.success(TimelinePage((25 downTo 24).map(::post))))
+        fixture.assertAtRow(index = 2, postNumber = 24) // One new post and the static marker.
+    }
+
+    @Test fun dockJumpToUnmeasuredListTimesOutWithoutRefreshing() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val refreshes = AtomicInteger()
+        withTimeout(2_000L) {
+            withContext(Dispatchers.Main) {
+                val fixture = Fixture(::post, ReadingPreferences())
+                val timeline = fixture.openTimeline(context, TimelineKind.Following, listOf(post(24)))
+                // A detached list cannot lay out the requested head. The child must finish
+                // without a refresh before the enclosing test timeout.
+                timeline.goToTimelineTopAndRefresh(LazyListState(), this) { refreshes.incrementAndGet() }
+            }
+        }
+        assertEquals(0, refreshes.get())
+    }
+
+    @Test fun selectedShortcutDoubleKeepsOldTopWhenFoldingIsDisabled() {
+        val fixture = mount(reverseReading = false, withShortcut = true)
+        val shortcut = compose.onNodeWithContentDescription(ViboDockEntry.forTimeline(TimelineKind.FriendsCircle).title)
+        shortcut.performTouchInput { click() }
+        compose.waitUntil(2_000) { fixture.switches.get() == 1 }
+        fixture.scrollTo(index = 10, offset = 19)
+        shortcut.assertIsSelected().performTouchInput { doubleClick() }
+        fixture.assertAtRow(index = 0, postNumber = 24)
+        compose.runOnIdle {
+            assertEquals(post(24).id to 0, fixture.dockRefreshStart)
+            assertEquals(1, fixture.refreshes)
+        }
+        fixture.finishDockRefresh(Result.success(TimelinePage((27 downTo 24).map(::post))))
+        fixture.assertAtRow(index = 3, postNumber = 24)
+        compose.runOnIdle {
+            assertNull(fixture.timeline.feedProjection.dividerIndex)
+            assertEquals((27 downTo 1).map(::post), fixture.timeline.feedProjection.visibleItems)
+            assertEquals(1, fixture.refreshes)
+        }
+    }
+
+    @Test fun selectedDoubleDoesNotOverrideScrollingWhileRefreshIsPending() {
+        val fixture = mount()
+        fixture.scrollTo(index = 12, offset = 19)
+        home().assertIsSelected().performTouchInput { doubleClick() }
+        fixture.assertAtRow(index = 0, postNumber = 24)
+        fixture.scrollTo(index = 12, offset = 15)
+        val readingPosition = fixture.firstVisibleRow()
+        fixture.finishDockRefresh(Result.success(TimelinePage((27 downTo 24).map(::post))))
+        assertEquals(readingPosition, fixture.firstVisibleRow())
+        compose.runOnIdle { assertEquals(1, fixture.refreshes) }
     }
 
     @Test fun inactiveShortcutSingleSelectsAndActiveShortcutSingleOnlyReturnsToTop() {
@@ -253,14 +337,14 @@ class ReverseHomeReselectComposeTest {
         cases.forEach { (scenario, result) ->
             fixture.scrollTo(index = 10, offset = 19)
             home().assertIsSelected().performTouchInput { doubleClick() }
+            val anchoredRow = fixture.firstVisibleRow()
             fixture.finishDockRefresh(result)
+            assertEquals(scenario, anchoredRow, fixture.firstVisibleRow())
             compose.runOnIdle {
                 assertNull(scenario, fixture.timeline.feedRefreshHint)
                 assertEquals(scenario, previousBatch, fixture.timeline.confirmedRefresh)
                 assertEquals(scenario, 1, fixture.timeline.feedProjection.gap?.hiddenPostCount)
                 assertTrue(scenario, fixture.timeline.items.containsAll((26 downTo 1).map(::post)))
-                assertEquals(scenario, 0, fixture.listState.firstVisibleItemIndex)
-                assertEquals(scenario, 0, fixture.listState.firstVisibleItemScrollOffset)
             }
         }
         compose.runOnIdle { assertEquals(cases.size, fixture.refreshes) }
@@ -329,6 +413,7 @@ class ReverseHomeReselectComposeTest {
         compose.setContent {
             val context = LocalContext.current
             val listState = rememberLazyListState()
+            val scope = rememberCoroutineScope()
             val (homeTimeline, shortcutTimeline) = remember {
                 fun session(route: TimelineKind, rows: List<FeedItem>) =
                     fixture.openTimeline(context, route, rows)
@@ -391,7 +476,7 @@ class ReverseHomeReselectComposeTest {
                             },
                             onEntryDoubleClick = {
                                 fixture.topJumps.incrementAndGet()
-                                timeline.goToTimelineTopAndRefresh(listState, fixture::startDockRefresh)
+                                timeline.goToTimelineTopAndRefresh(listState, scope, fixture::startDockRefresh)
                             },
                             profileAvatar = null,
                         ),
@@ -422,6 +507,8 @@ class ReverseHomeReselectComposeTest {
         val switches = AtomicInteger()
         val homeSwitches = AtomicInteger()
         private var pendingDockBaseline: ExplicitTimelineRefreshBaseline? = null
+        var dockRefreshStart: Pair<Any, Int>? = null
+            private set
         val accountId = (System.nanoTime() and Long.MAX_VALUE).toString()
 
         fun openTimeline(
@@ -449,21 +536,26 @@ class ReverseHomeReselectComposeTest {
         }
 
         fun startDockRefresh() {
+            dockRefreshStart = currentFirstVisibleRow()
             refreshes++
             timeline.timelineRequestGeneration++
             timeline.feedRefreshHint = null
             pendingDockBaseline = requireNotNull(timeline.captureExplicitRefreshBaseline(accountId))
+            timeline.isLoading = true
         }
 
         fun finishDockRefresh(result: Result<TimelinePage>) = compose.runOnIdle {
             val baseline = requireNotNull(pendingDockBaseline)
             pendingDockBaseline = null
+            timeline.isLoading = false
             val page = result.getOrNull() ?: return@runOnIdle
             val count = timeline.publishRefresh(
                 page, listState, protectViewport = true, keepReading = true,
-                explicitBaseline = baseline, returnToTop = true,
+                explicitBaseline = baseline,
             )
-            if (count == 0) timeline.feedRefreshHint = "没有新微博了"
+            if (count == 0 && listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
+                timeline.feedRefreshHint = "没有新微博了"
+            }
         }
 
         fun deliverRefresh(result: Result<TimelinePage>, explicit: Boolean) = compose.runOnIdle {
@@ -512,9 +604,12 @@ class ReverseHomeReselectComposeTest {
             return projection.lazyIndexOfPost(index)
         }
 
-        fun firstVisibleRow(): Pair<Any, Int> = compose.runOnIdle {
-            val row = listState.layoutInfo.visibleItemsInfo.first { it.index == listState.firstVisibleItemIndex }
-            row.key to listState.firstVisibleItemScrollOffset
+        fun firstVisibleRow(): Pair<Any, Int> = compose.runOnIdle { requireNotNull(currentFirstVisibleRow()) }
+
+        private fun currentFirstVisibleRow(): Pair<Any, Int>? {
+            val row = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == listState.firstVisibleItemIndex }
+                ?: return null
+            return row.key to listState.firstVisibleItemScrollOffset
         }
 
         fun scrollPastPaddingAtPost(number: Int) = compose.runOnIdle {
