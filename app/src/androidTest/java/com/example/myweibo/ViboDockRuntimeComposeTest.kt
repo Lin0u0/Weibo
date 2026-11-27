@@ -13,6 +13,8 @@ import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.click
+import androidx.compose.ui.test.doubleClick
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.longClick
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -22,6 +24,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.example.myweibo.data.TimelineGroup
@@ -33,6 +36,7 @@ import com.example.myweibo.ui.MainTab
 import com.example.myweibo.ui.ViboDockRuntime
 import com.example.myweibo.ui.WeiboLiquidBottomBar
 import com.kyant.backdrop.backdrops.emptyBackdrop
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -77,7 +81,7 @@ class ViboDockRuntimeComposeTest {
                                 clickedEntry = it
                                 selectedEntryId = it.id
                             },
-                            profileAvatarUrl = null,
+                            profileAvatar = null,
                         ),
                     )
                 }
@@ -136,7 +140,7 @@ class ViboDockRuntimeComposeTest {
                             catalogue = catalogue,
                             selectedEntryId = selectedEntryId,
                             onEntrySelected = { selections++ },
-                            profileAvatarUrl = null,
+                            profileAvatar = null,
                         ),
                     )
                 }
@@ -160,6 +164,78 @@ class ViboDockRuntimeComposeTest {
         entry(special).assert(notSelected)
         entry(favorites).assert(notSelected)
         compose.runOnIdle { assertEquals(0, selections) }
+    }
+
+    @Test fun doubleTouchOnArbitraryTimelineIsExclusiveWhenCapsuleFits() = assertExclusiveTimelineDoubleTouch(380.dp)
+
+    @Test fun doubleTouchOnArbitraryTimelineIsExclusiveWhenCapsuleScrolls() = assertExclusiveTimelineDoubleTouch(280.dp)
+
+    private fun assertExclusiveTimelineDoubleTouch(width: Dp) {
+        val shortcut = ViboDockEntry.forTimeline(TimelineKind.Favorites)
+        val order = listOf(ViboDockEntry.Home.id, shortcut.id, ViboDockEntry.Messages.id, ViboDockEntry.Compose.id)
+        val singles = mutableListOf<ViboDockEntry>()
+        val doubles = mutableListOf<ViboDockEntry>()
+        val mainTabClicks = mutableListOf<MainTab>()
+        val singleReceived = AtomicBoolean(false)
+        var menuExpanded by mutableStateOf(false)
+        compose.setContent {
+            MaterialTheme {
+                Box(Modifier.size(width = width, height = 220.dp)) {
+                    WeiboLiquidBottomBar(
+                        selectedTab = MainTab.Feed,
+                        onTabChange = { mainTabClicks.add(it) },
+                        backdrop = emptyBackdrop(),
+                        timelineMenuExpanded = menuExpanded,
+                        onTimelineMenuExpandedChange = { menuExpanded = it },
+                        timelineMenuContent = { Text("Timeline picker") },
+                        modifier = Modifier.align(Alignment.BottomCenter),
+                        dockPreferences = ViboDockPreferences(visibleEntryIds = order, entryOrder = order),
+                        glassAmount = 0f,
+                        applyNavigationBarInsets = false,
+                        dockRuntime = ViboDockRuntime(
+                            catalogue = listOf(shortcut),
+                            onEntrySelected = {
+                                singles.add(it)
+                                singleReceived.set(true)
+                            },
+                            profileAvatar = null,
+                            onEntryDoubleClick = { doubles.add(it) },
+                        ),
+                    )
+                }
+            }
+        }
+
+        val tab = entry(shortcut).assertIsDisplayed()
+        tab.performTouchInput { doubleClick() }
+        compose.runOnIdle {
+            assertEquals(listOf(shortcut), doubles)
+            assertTrue(singles.isEmpty())
+            assertTrue(!menuExpanded)
+        }
+        entry(ViboDockEntry.Home).assertIsSelected().performTouchInput { doubleClick() }
+        val doubleEvents = listOf(shortcut, ViboDockEntry.Home)
+        compose.runOnIdle {
+            assertEquals(doubleEvents, doubles)
+            assertTrue(mainTabClicks.isEmpty())
+            assertTrue(!menuExpanded)
+        }
+        tab.performTouchInput { longClick() }
+        compose.onNodeWithText("Timeline picker").assertIsDisplayed()
+        compose.runOnIdle {
+            assertTrue(singles.isEmpty())
+            assertEquals(doubleEvents, doubles)
+            menuExpanded = false
+        }
+        // Finish the long-press menu's exit before injecting the independent tap.
+        compose.onNodeWithText("Timeline picker").assertDoesNotExist()
+        tab.performTouchInput { click() }
+        compose.waitUntil(timeoutMillis = 2_000) { singleReceived.get() }
+        compose.runOnIdle {
+            assertEquals(listOf(shortcut), singles)
+            assertEquals(doubleEvents, doubles)
+            assertTrue(mainTabClicks.isEmpty())
+        }
     }
 
     private fun entry(entry: ViboDockEntry) = compose.onNodeWithContentDescription(entry.title)

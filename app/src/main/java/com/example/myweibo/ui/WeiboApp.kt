@@ -143,6 +143,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -365,6 +366,8 @@ import com.example.myweibo.data.LivePhotoContainerMirrorDetector
 import com.example.myweibo.data.LivePhotoMirrorCorrectionStore
 import com.example.myweibo.data.LivePhotoMirrorDetector
 import com.example.myweibo.data.ImageUrlResolver
+import com.example.myweibo.data.ProfileCoverState
+import com.example.myweibo.data.ProfileCoverUrls
 import com.example.myweibo.data.BitmapExifOrientation
 import com.example.myweibo.data.buildSaveMetadata
 import com.example.myweibo.data.resolveForSave
@@ -419,6 +422,9 @@ import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.FeedTimelineRefreshProjection
 import com.example.myweibo.data.TimelinePage
+import com.example.myweibo.data.TimelineUnreadScope
+import com.example.myweibo.data.TimelineUnreadSnapshot
+import com.example.myweibo.data.TimelineUnreadStore
 import com.example.myweibo.data.feedItemSortKey
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.mergeFeedTimelineRefresh
@@ -435,8 +441,6 @@ import com.example.myweibo.ui.liquidglass.LocalLiquidMenuBackdrop
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidCapsule
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidMenuCard
 import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
-import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
-import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
 import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSwitch
 import androidx.compose.ui.semantics.Role
@@ -446,7 +450,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSlider
 import com.example.myweibo.ui.liquidglass.SettingsLiquidToggle
-import com.example.myweibo.ui.liquidglass.liquidLargeCapsuleSurfaceColor
 import com.example.myweibo.ui.liquidglass.liquidRegularMenuGlassEffects
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
@@ -3967,6 +3970,7 @@ private suspend fun loadAlbumGridBitmap(
                     connectTimeoutMs = 5000,
                     readTimeoutMs = 5000,
                     maxReadBytes = AlbumGridMaxReadBytes,
+                    profileCover = image.isProfileCover,
                 )
                 decodeBitmapFromBytes(bytes, maxDecodeDim)
             }
@@ -4046,6 +4050,7 @@ private suspend fun loadRemoteBitmap(
     maxDecodeDim: Int,
     connectTimeoutMs: Int = 8000,
     readTimeoutMs: Int = 8000,
+    profileCover: Boolean = false,
 ): Bitmap? {
     decodeCachedRemoteBitmap(url, maxDecodeDim)?.let { return it }
     val bytes = fetchRemoteBytes(
@@ -4053,6 +4058,7 @@ private suspend fun loadRemoteBitmap(
         connectTimeoutMs = connectTimeoutMs,
         readTimeoutMs = readTimeoutMs,
         maxReadBytes = remoteReadLimitForDecodeDim(maxDecodeDim),
+        profileCover = profileCover,
     )
     return decodeBitmapFromBytes(bytes, maxDecodeDim)
 }
@@ -4255,6 +4261,7 @@ internal class HomeTimelineReadingState(
     val cacheStore: TimelineCacheStore,
     initialKind: TimelineKind,
     initialPreferences: ReadingPreferences = preferencesStore.read(),
+    private val unreadStore: TimelineUnreadStore? = null,
 ) {
     var preferences by mutableStateOf(initialPreferences)
         private set
@@ -4286,6 +4293,40 @@ internal class HomeTimelineReadingState(
     var followingDiskIds by mutableStateOf<Set<String>>(emptySet())
     var timelineCacheSessionGeneration by mutableIntStateOf(0)
     var timelineCacheAccountId by mutableStateOf<String?>(null)
+
+    val unreadScope by derivedStateOf {
+        TimelineUnreadScope.of(timelineCacheAccountId, timelineKind, selectedTimelineGroupId)
+    }
+    private var unreadRoute by mutableStateOf<Pair<TimelineUnreadScope, TimelineUnreadSnapshot>?>(null)
+    val activeUnreadSnapshot: TimelineUnreadSnapshot
+        get() = unreadRoute?.takeIf { it.first == unreadScope }?.second ?: TimelineUnreadSnapshot()
+    val visibleUnreadCount: Int get() = activeUnreadSnapshot.displayCount
+
+    fun restoreUnread() {
+        val scope = unreadScope
+        if (scope == unreadRoute?.first) return
+        unreadRoute = scope?.let { route -> unreadStore?.read(route)?.let { route to it } }
+    }
+
+    private fun updateUnread(scope: TimelineUnreadScope, update: (TimelineUnreadSnapshot) -> TimelineUnreadSnapshot) {
+        if (scope != unreadScope) return
+        restoreUnread()
+        val previous = activeUnreadSnapshot
+        val updated = update(previous)
+        if (updated != previous) {
+            unreadStore?.write(scope, updated)
+            unreadRoute = scope to updated
+        }
+    }
+
+    fun recordUnreadRefresh(verifiedAccountId: String?, page: TimelinePage) {
+        val scope = unreadScope?.takeIf { it.accountId == verifiedAccountId } ?: return
+        updateUnread(scope) { it.refreshed(scope, page.items, items) }
+    }
+
+    fun markUnreadViewed(scope: TimelineUnreadScope, statusIds: Set<String>) {
+        updateUnread(scope) { it.markViewed(statusIds) }
+    }
 
     val feedProjection by derivedStateOf {
         projectFeedTimelineRefresh(
@@ -4328,16 +4369,19 @@ internal class HomeTimelineReadingState(
         reverseBrowseGapExpanded = !reverseBrowseGapExpanded
     }
 
+    fun currentVerifiedTimelineAccount(accountStore: WeiboAccountStore, requestedAccountId: String?): String? =
+        timelineCacheAccountId?.takeIf {
+            it == requestedAccountId && it == accountMatchingTimelineCookie(accountStore.getAccount(it))
+        }
+
     fun currentFollowingCacheAccount(
         accountStore: WeiboAccountStore,
         kind: TimelineKind,
         groupId: String?,
         requestedAccountId: String?,
-    ): String? =
-        timelineCacheAccountId?.takeIf {
-            kind == TimelineKind.Following && groupId == null && it == requestedAccountId &&
-                it == accountMatchingTimelineCookie(accountStore.getAccount(it))
-        }
+    ): String? = if (kind == TimelineKind.Following && groupId == null) {
+        currentVerifiedTimelineAccount(accountStore, requestedAccountId)
+    } else null
 
     fun forgetTimelineCacheAccount() {
         timelineCacheSessionGeneration += 1
@@ -4408,8 +4452,10 @@ fun WeiboApp() {
     val homeTimeline = remember {
         HomeTimelineReadingState(
             ReadingPreferencesStore(context), TimelineCacheStore(context), feedDisplaySettingsStore.readTimelineKind(),
+            unreadStore = TimelineUnreadStore(context),
         )
     }
+    LaunchedEffect(homeTimeline.unreadScope) { homeTimeline.restoreUnread() }
     val reverseBrowsingEnabled = homeTimeline.preferences.reverseReading
     var showCommentLikeCount by remember { mutableStateOf(feedDisplaySettingsStore.readShowCommentLikeCount()) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
@@ -6376,7 +6422,8 @@ fun WeiboApp() {
         }
     }
 
-    fun refreshTimeline(showRefreshHint: Boolean = true) {
+    fun refreshTimeline(showRefreshHint: Boolean = true, dockGesture: Boolean = false) {
+        if (dockGesture && homeTimeline.timelineRefreshJob?.isActive == true) return
         homeTimeline.timelineRefreshJob?.cancel()
         homeTimeline.timelineLoadMoreJob?.cancel()
         homeTimeline.timelineRequestGeneration += 1
@@ -6398,10 +6445,11 @@ fun WeiboApp() {
             homeTimeline.feedLoadingMore = false
             hasLoginCookie = session.hasLoginCookie()
             try {
-                if (!preserveViewport && feedListState.layoutInfo.totalItemsCount > 0) {
+                if (!dockGesture && !preserveViewport && feedListState.layoutInfo.totalItemsCount > 0) {
                     feedListState.animateScrollToTopSmooth()
                 }
-                val cacheAccountId = homeTimeline.currentFollowingCacheAccount(accountStore, requestedKind, requestedGroupId, requestedAccountId)
+                val unreadOwner = homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
+                val cacheAccountId = unreadOwner.takeIf { requestedKind == TimelineKind.Following && requestedGroupId == null }
                 runCatchingPreservingCancellation {
                     if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
                         val raw = requestedGroupId?.let { session.loadTimelineGroupRaw(it) }
@@ -6421,7 +6469,17 @@ fun WeiboApp() {
                             showMessage("没有读取到微博", "请稍后刷新")
                             return@onSuccess
                         }
-                        homeTimeline.publishRefresh(page, feedListState, protectViewport, keepReading)
+                        if (dockGesture && page.items.isEmpty() && previousItems.isNotEmpty()) {
+                            homeTimeline.feedRefreshHint = null
+                            showMessage("没有读取到微博", "请稍后刷新")
+                            return@onSuccess
+                        }
+                        if (unreadOwner != null && cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration &&
+                            unreadOwner == homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
+                        ) {
+                            homeTimeline.recordUnreadRefresh(unreadOwner, page)
+                        }
+                        homeTimeline.publishRefresh(page, feedListState, protectViewport || (dockGesture && previousItems.isNotEmpty()), keepReading)
                         if (page.items.isNotEmpty() || !keepReading) preservedFeedSourceItem = null
                         reconcileFeedLikeState(page.items)
                         if (requestedKind == TimelineKind.SpecialFollowing) {
@@ -6477,7 +6535,7 @@ fun WeiboApp() {
                     homeTimeline.timelineRefreshJob = null
                 }
             }
-            if (!preserveViewport && routeIsCurrent() && feedListState.layoutInfo.totalItemsCount > 0) {
+            if (!dockGesture && !preserveViewport && routeIsCurrent() && feedListState.layoutInfo.totalItemsCount > 0) {
                 feedListState.animateScrollToTopSmooth()
             }
         }
@@ -6485,24 +6543,24 @@ fun WeiboApp() {
 
     fun refreshTimelineFromTop() = refreshTimeline()
 
-    fun switchTimelineKind(kind: TimelineKind) {
+    fun switchTimelineKind(kind: TimelineKind, dockGesture: Boolean = false) {
         if (kind == homeTimeline.timelineKind && homeTimeline.selectedTimelineGroupId == null) return
         homeTimeline.resetTimelineReadingSession()
         preservedFeedSourceItem = null
         homeTimeline.timelineKind = kind
         homeTimeline.selectedTimelineGroupId = null
         feedDisplaySettingsStore.writeTimelineKind(kind)
-        refreshTimeline(showRefreshHint = false)
+        refreshTimeline(showRefreshHint = false, dockGesture = dockGesture)
     }
 
-    fun switchTimelineGroup(group: TimelineGroup, selectFeed: Boolean = true) {
+    fun switchTimelineGroup(group: TimelineGroup, selectFeed: Boolean = true, dockGesture: Boolean = false) {
         homeTimeline.resetTimelineReadingSession()
         preservedFeedSourceItem = null
         homeTimeline.selectedTimelineGroupId = group.id
         homeTimeline.timelineKind = TimelineKind.SpecialFollowing
         feedDisplaySettingsStore.writeTimelineKind(TimelineKind.SpecialFollowing)
         if (selectFeed) selectedTab = MainTab.Feed
-        refreshTimeline(showRefreshHint = false)
+        refreshTimeline(showRefreshHint = false, dockGesture = dockGesture)
     }
 
     fun loadMore() {
@@ -6652,7 +6710,13 @@ fun WeiboApp() {
         val requestedAccountId = activeAccountId
         scope.launch {
             mineProfileLoading = true
-            runCatching { session.loadCurrentUserProfile() }
+            runCatching {
+                val candidate = session.loadCurrentUserProfileCandidate(requestedAccountId)
+                val cached = if (requestedAccountId != null && candidate.coverState == ProfileCoverState.Omitted) {
+                    mineCacheStore.readProfile(requestedAccountId)
+                } else null
+                candidate.retainOmittedCover(requestedAccountId, cached)
+            }
                 .onSuccess { profile ->
                     if (requestGeneration != mineAccountGeneration ||
                         requestedAccountId != activeAccountId ||
@@ -8744,12 +8808,18 @@ fun WeiboApp() {
             LocalImageSaveHint provides imageSaveHintController,
             LocalVoiceAudioController provides voiceAudioController,
             LocalVideoPeekController provides videoPeekController,
+            LocalVideoChromeStyle provides VideoChromeStyle(bottomBarFrostAmount, bottomBarGlassAmount),
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
             LocalFeedBodyTextStyle provides feedTypographyMetrics.body,
             LocalFeedTypographyMetrics provides feedTypographyMetrics,
             LocalFeedEmoticonInlineContent provides feedEmoticonInlineContent,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
+            val unreadFeedOnTop = selectedTab == MainTab.Feed && hasLoginCookie &&
+                activeAccountId != null && homeTimeline.timelineCacheAccountId == activeAccountId &&
+                selectedItem == null && visitedUserId == null && navOverlayStack.isEmpty() &&
+                navExitPendingKind == null && likeUsersOverlay == null && commentComposeTarget == null &&
+                !timelineMenuExpanded && message == null
             Box(
                 Modifier.fillMaxSize()
                     .onGloballyPositioned { searchMenuHost = it }
@@ -8985,6 +9055,7 @@ fun WeiboApp() {
                                 hasLoginCookie = hasLoginCookie,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
+                                unreadUiOnTop = unreadFeedOnTop,
                                 onRefresh = { refreshTimeline() },
                                 onLoadMore = { loadMore() },
                                 onOpenLoginSettings = ::openAccountLoginManagement,
@@ -10134,30 +10205,31 @@ fun WeiboApp() {
                     )
                 }
             }
-            key(homeTimeline.feedRefreshHintGeneration) {
-            AnimatedVisibility(
-                visible = capsuleHintState != null,
-                enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
-                exit = fadeOut(tween(180)) + slideOutVertically(tween(180)) { fullHeight -> -fullHeight / 2 },
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = feedRefreshTopInset + 10.dp)
-                    .zIndex(90f),
+            TimelineUnreadHeader(
+                count = if (unreadFeedOnTop && saveHintState == null && !exitHintVisible) homeTimeline.visibleUnreadCount else 0,
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = feedRefreshTopInset + 10.dp).zIndex(90f),
             ) {
-                capsuleHintState?.let { hint ->
-                    FeedRefreshCapsuleHint(
-                        message = hint.message,
-                        tone = hint.tone,
-                        autoDismissMillis = hint.autoDismissMillis,
-                        onDismiss = {
-                            when {
-                                operationCapsuleHint != null -> operationCapsuleHint = null
-                                else -> homeTimeline.feedRefreshHint = null
-                            }
-                        },
-                    )
+                key(homeTimeline.feedRefreshHintGeneration) {
+                    AnimatedVisibility(
+                        visible = capsuleHintState != null,
+                        enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
+                        exit = fadeOut(tween(180)) + slideOutVertically(tween(180)) { fullHeight -> -fullHeight / 2 },
+                    ) {
+                        capsuleHintState?.let { hint ->
+                            FeedRefreshCapsuleHint(
+                                message = hint.message,
+                                tone = hint.tone,
+                                autoDismissMillis = hint.autoDismissMillis,
+                                onDismiss = {
+                                    when {
+                                        operationCapsuleHint != null -> operationCapsuleHint = null
+                                        else -> homeTimeline.feedRefreshHint = null
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
-            }
             }
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
                 if (returningHomeDirectly && bottomBarNavVisible && bottomBarVisible) {
@@ -10179,13 +10251,17 @@ fun WeiboApp() {
                     )
                 }
             }
-            fun openDockTimeline(kind: TimelineKind) {
+            fun openDockTimeline(kind: TimelineKind, refresh: Boolean = false) {
                 leaveRetainedSearchForTabSwitch()
                 dismissFollowListForTabSwitch()
                 selectedTab = MainTab.Feed
-                switchTimelineKind(kind)
+                if (refresh && kind == homeTimeline.timelineKind && homeTimeline.selectedTimelineGroupId == null) {
+                    refreshTimeline(dockGesture = true)
+                } else {
+                    switchTimelineKind(kind, dockGesture = refresh)
+                }
             }
-            fun openDockGroup(group: TimelineGroup) {
+            fun openDockGroup(group: TimelineGroup, refresh: Boolean = false) {
                 val ownerId = homeTimeline.timelineGroupsOwnerId ?: return
                 if (!hasLoginCookie || ownerId != activeAccountId || ownerId != homeTimeline.timelineCacheAccountId ||
                     homeTimeline.timelineGroups.none { it.id == group.id }
@@ -10194,8 +10270,9 @@ fun WeiboApp() {
                 dismissFollowListForTabSwitch()
                 if (homeTimeline.selectedTimelineGroupId == group.id) {
                     selectedTab = MainTab.Feed
+                    if (refresh) refreshTimeline(dockGesture = true)
                 } else {
-                    switchTimelineGroup(group)
+                    switchTimelineGroup(group, dockGesture = refresh)
                 }
             }
             val visibleTimelineGroups = homeTimeline.timelineGroups.takeIf {
@@ -10264,12 +10341,17 @@ fun WeiboApp() {
                         catalogue = shortcuts,
                         selectedEntryId = selectedViboTimelineShortcut(shortcuts, homeTimeline.timelineKind, homeTimeline.selectedTimelineGroupId),
                         onEntrySelected = { entry ->
-                            entry.group?.let(::openDockGroup) ?: entry.timelineKind?.let(::openDockTimeline)
+                            entry.group?.let { openDockGroup(it) } ?: entry.timelineKind?.let { openDockTimeline(it) }
                         },
-                        profileAvatarUrl = homeTimeline.timelineCacheAccountId?.takeIf { hasLoginCookie && it == activeAccountId }?.let { ownerId ->
-                            mineProfile?.takeIf { it.id == ownerId }?.avatarUrl?.takeIf(String::isNotBlank)
-                                ?: storedAccounts.firstOrNull { it.id == ownerId }?.avatarUrl
+                        onEntryDoubleClick = { entry ->
+                            bottomBarVisible = true
+                            bottomBarScrollDistance[0] = 0f
+                            entry.group?.let { openDockGroup(it, refresh = true) }
+                                ?: entry.timelineKind?.let { openDockTimeline(it, refresh = true) }
                         },
+                        profileAvatar = resolveViboDockAvatarRequest(
+                            homeTimeline.timelineCacheAccountId, activeAccountId, hasLoginCookie, mineProfile, storedAccounts,
+                        ),
                     ),
                     onTabChange = tabChange@{ tab ->
                         if (tab == MainTab.Search && selectedTab != MainTab.Search) {
@@ -11074,6 +11156,7 @@ internal fun FollowFeedScreen(
     onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
+    unreadUiOnTop: Boolean = feedUiOnTop && hasLoginCookie,
 ) {
     val topInset = WindowInsets.statusBarsIgnoringVisibility.asPaddingValues().calculateTopPadding()
 
@@ -11102,6 +11185,8 @@ internal fun FollowFeedScreen(
     val lineLimit = homeTimeline.foldedPostLineLimit
     val longPostController = homeTimeline.longPostController(listState)
     val navTopInRoot = LocalImageReturnBarTop.current
+    // The home dock floats above the list rather than contributing to its content padding.
+    val scrollIndicatorBottomInset = 72.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val topContentInsetPx = with(LocalDensity.current) { topInset.toPx() }
     val sourceItems = homeTimeline.items
     LaunchedEffect(sourceItems, longPostController) {
@@ -11133,7 +11218,12 @@ internal fun FollowFeedScreen(
         LazyColumn(
             state = listState,
             flingBehavior = rememberWeiboListFlingBehavior(),
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().feedScrollIndicator(
+                state = listState,
+                topInset = topInset + 12.dp,
+                bottomInset = scrollIndicatorBottomInset,
+                enabled = items.isNotEmpty(),
+            ),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
             if (items.isEmpty() && !isLoading) {
@@ -11223,6 +11313,7 @@ internal fun FollowFeedScreen(
         modifier = Modifier.fillMaxSize(),
     ) {
         feedContent()
+        ObserveTimelineUnread(homeTimeline, listState, unreadUiOnTop, topContentInsetPx, navTopInRoot)
         // A detail covers the still-mounted feed. Keep its readable viewport so the
         // expanded source card has the same collapse control at the return handoff.
         if (lineLimit != null) {
@@ -17248,11 +17339,11 @@ private fun InlineVideoPlayer(
                 showPictureInPictureButton = false,
             )
         } else if (!suppressPausedCover) {
-            val coverPlayBackdrop = rememberLayerBackdrop()
+            val coverPlayBackdrop = rememberVideoChromeBackdrop()
             Box(
                 Modifier
                     .fillMaxSize()
-                    .layerBackdrop(coverPlayBackdrop),
+                    .videoChromeBackdropSource(coverPlayBackdrop),
             ) {
                 RemoteImage(
                     url = media.coverUrl,
@@ -17265,7 +17356,7 @@ private fun InlineVideoPlayer(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
-                TransparentLiquidIconButton(
+                VideoChromeButton(
                     onClick = {
                         if (media.isStreamPlayable()) {
                             openAnchoredInlinePlayback()
@@ -17275,9 +17366,6 @@ private fun InlineVideoPlayer(
                     },
                     backdrop = coverPlayBackdrop,
                     modifier = Modifier.size(playButtonSize),
-                    useLargeCapsuleEffect = true,
-                    largeCapsuleRefractionHeight = 12.dp,
-                    largeCapsuleRefractionAmount = 20.dp,
                 ) {
                     Icon(
                         painter = painterResource(R.drawable.ic_video_play),
@@ -17461,7 +17549,7 @@ private fun WeiboVideoSurface(
     }
 
     if (isPlaybackUnavailable || playbackUrl.isBlank()) {
-        val videoControlBackdrop = rememberLayerBackdrop()
+        val videoControlBackdrop = rememberVideoChromeBackdrop(enabled = controlsEnabled && !isFullscreen)
         Box(
             modifier = modifier.background(Color.Black),
             contentAlignment = Alignment.Center,
@@ -17469,7 +17557,7 @@ private fun WeiboVideoSurface(
             Box(
                 Modifier
                     .fillMaxSize()
-                    .layerBackdrop(videoControlBackdrop),
+                    .videoChromeBackdropSource(videoControlBackdrop),
             ) {
                 Box(
                     modifier = Modifier
@@ -17496,7 +17584,7 @@ private fun WeiboVideoSurface(
                 }
             }
             if (controlsEnabled && !isFullscreen) {
-                GlassTextButton(
+                VideoChromeTextButton(
                     text = "全屏",
                     backdrop = videoControlBackdrop,
                     modifier = Modifier
@@ -18623,17 +18711,41 @@ private fun WeiboVideoSurface(
                 },
             ),
     ) {
-        val videoControlBackdrop = rememberLayerBackdrop()
-        Box(
-            Modifier
-                .fillMaxSize()
-                .layerBackdrop(videoControlBackdrop),
-        ) {
+        val videoControlBackdrop = rememberVideoChromeBackdrop(enabled = controlsEnabled)
+        Box(Modifier.fillMaxSize()) {
             Box(
                 modifier = Modifier
                     .matchParentSize()
                     .background(Color.Black),
             )
+            if (videoControlBackdrop != null) {
+                // Sample a Compose-only stand-in, never the AndroidView/TextureView. This
+                // capture isn't drawn over video and uses only already available bitmaps.
+                Box(
+                    Modifier.matchParentSize()
+                        .videoChromeBackdropSource(videoControlBackdrop, drawSource = false)
+                        .background(Brush.verticalGradient(listOf(Color(0xFF41464E), Color(0xFF101216)))),
+                ) {
+                    val frame = if (videoFrameReady) null else transitionFrame.takeIfDrawable()
+                    val homeThumbnails = LocalHomeThumbnailStore.current
+                    val poster = remember(media.coverUrl, homeThumbnails, videoFrameReady) {
+                        val url = media.coverUrl
+                        ImageUrlResolver.videoCoverCacheKey(url)?.let { key ->
+                            homeThumbnails?.get(key)?.takeIfDrawable()
+                                ?: StableFeedThumbnailCache.get(key)?.takeIfDrawable()
+                                ?: url?.let { FeedBitmapCache.get(it)?.takeIfDrawable() }
+                        }
+                    }
+                    (frame ?: poster?.takeIfDrawable())?.let { bitmap ->
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit,
+                        )
+                    }
+                }
+            }
             Box(
                 Modifier
                     .fillMaxSize()
@@ -18882,9 +18994,7 @@ private fun WeiboVideoSurface(
         }
         }
 
-            // Record the handoff frame in the same backdrop as live video.
-            // Otherwise glass controls sample a black, not-yet-attached view
-            // while the user sees this frame in a separate foreground layer.
+            // Keep the existing visible handoff frame above the player until its first frame.
             AnimatedVisibility(
                 visible = !videoFrameReady &&
                     playbackError == null &&
@@ -18945,17 +19055,12 @@ private fun WeiboVideoSurface(
                 )
                 .zIndex(15f),
         ) {
-            TransparentLiquidCapsule(
+            VideoChromeCapsule(
                 modifier = Modifier
                     .width(42.dp)
                     .height(34.dp),
                 backdrop = videoControlBackdrop,
-                pill = true,
-                surfaceColor = Color.White.copy(alpha = 0.12f),
-                useLargeCapsuleEffect = true,
-                showShadow = false,
-                largeCapsuleRefractionHeight = 16.dp,
-                largeCapsuleRefractionAmount = 28.dp,
+                profile = VideoChromeLens.Boost,
             ) {
                 Text(
                     text = "2×",
@@ -18983,7 +19088,7 @@ private fun WeiboVideoSurface(
             exit = fadeOut(tween(180)),
             modifier = Modifier.align(Alignment.TopStart).zIndex(if (isFullscreen) 20f else 2f),
         ) {
-            GlassTextButton(
+            VideoChromeTextButton(
                 text = if (isFullscreen) { if (downloading) "保存中" else "保存" } else "全屏",
                 backdrop = videoControlBackdrop,
                 modifier = Modifier
@@ -19017,7 +19122,7 @@ private fun WeiboVideoSurface(
                 .align(Alignment.TopEnd)
                 .zIndex(if (isFullscreen) 20f else 2f),
         ) {
-            GlassTextButton(
+            VideoChromeTextButton(
                 text = "浮窗",
                 backdrop = videoControlBackdrop,
                 modifier = Modifier
@@ -19115,7 +19220,7 @@ private fun WeiboVideoSurface(
         }
 
         if (showSpeedMenu && controlsEnabled && controlsVisible && !hideProgressControls) {
-    WeiboVideoSpeedPopup(
+            WeiboVideoSpeedPopup(
                 selectedSpeed = selectedSpeed,
                 backdrop = videoControlBackdrop,
                 controlBarHeight = resolvedVideoControlBarHeight,
@@ -19145,21 +19250,16 @@ private fun WeiboVideoSurface(
 @Composable
 private fun WeiboVideoSpeedPopup(
     selectedSpeed: Float,
-    backdrop: Backdrop,
+    backdrop: Backdrop?,
     onSpeedSelected: (Float) -> Unit,
     controlBarHeight: Dp = VideoControlBarHeight,
     modifier: Modifier = Modifier,
 ) {
-    TransparentLiquidCapsule(
+    VideoChromeCapsule(
         modifier = modifier
             .width(246.dp)
             .height(controlBarHeight),
         backdrop = backdrop,
-        pill = true,
-        surfaceColor = liquidLargeCapsuleSurfaceColor(isAppLightTheme()),
-        useLargeCapsuleEffect = true,
-        largeCapsuleRefractionHeight = 12.dp,
-        largeCapsuleRefractionAmount = 20.dp,
     ) {
         Row(
             modifier = Modifier
@@ -19199,25 +19299,22 @@ private fun WeiboVideoSpeedPopup(
 }
 
 @Composable
-private fun GlassTextButton(
+private fun VideoChromeTextButton(
     text: String,
-    backdrop: Backdrop,
+    backdrop: Backdrop?,
     modifier: Modifier,
     enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
-    TransparentLiquidTextButton(
-        text = text,
+    VideoChromeButton(
         onClick = onClick,
         backdrop = backdrop,
         modifier = modifier,
         enabled = enabled,
-        textColor = Color.White,
-        style = videoControlTextStyle(12),
-        useLargeCapsuleEffect = true,
-        largeCapsuleRefractionHeight = 10.dp,
-        largeCapsuleRefractionAmount = 18.dp,
-    )
+        profile = VideoChromeLens.Compact,
+    ) {
+        Text(text = text, color = Color.White, style = videoControlTextStyle(12), textAlign = TextAlign.Center)
+    }
 }
 
 @Composable
@@ -19229,7 +19326,7 @@ private fun VideoControls(
     onPlayPause: () -> Unit,
     onSeek: (Long) -> Unit,
     onSpeedClick: () -> Unit,
-    backdrop: Backdrop,
+    backdrop: Backdrop?,
     modifier: Modifier = Modifier,
     horizontalGestureExclusionKey: Any? = null,
     onScrubbingChanged: (Boolean) -> Unit = {},
@@ -19248,7 +19345,7 @@ private fun VideoControls(
     val swipeExclusionModifier = horizontalGestureExclusionKey?.let {
         Modifier.excludeParentHorizontalSwipe(it)
     } ?: Modifier
-    TransparentLiquidCapsule(
+    VideoChromeCapsule(
         modifier = modifier
             .then(swipeExclusionModifier)
             .pointerInput(durationState) {
@@ -19301,11 +19398,6 @@ private fun VideoControls(
                 }
             },
         backdrop = backdrop,
-        pill = true,
-        surfaceColor = liquidLargeCapsuleSurfaceColor(isAppLightTheme()),
-        useLargeCapsuleEffect = true,
-        largeCapsuleRefractionHeight = 12.dp,
-        largeCapsuleRefractionAmount = 20.dp,
     ) {
         VideoControlCapsuleProgressBackground(
             progress = progress,
@@ -23068,7 +23160,7 @@ private fun HotSearchRow(
 
 private const val SearchImeFollowDurationMillis = 120
 
-private class PersonalHotSearchState {
+internal class PersonalHotSearchState {
     var items by mutableStateOf<List<HotSearchItem>>(emptyList())
     var loading by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
@@ -23076,8 +23168,8 @@ private class PersonalHotSearchState {
 }
 
 @Composable
-private fun HotSearchBoards(
-    session: WeiboWebSession,
+internal fun HotSearchBoards(
+    loadPersonal: suspend () -> List<HotSearchItem>,
     pager: androidx.compose.foundation.pager.PagerState,
     personal: PersonalHotSearchState,
     standardItems: List<HotSearchItem>,
@@ -23094,7 +23186,7 @@ private fun HotSearchBoards(
         personal.loading = true
         personal.error = null
         try {
-            personal.items = session.loadPersonalHotSearch()
+            personal.items = loadPersonal()
             personal.generation = refreshGeneration
         } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException) throw error
@@ -23103,13 +23195,8 @@ private fun HotSearchBoards(
             personal.loading = false
         }
     }
-    // Render the board as part of the search screen's outer LazyColumn. This
-    // keeps one continuous vertical scroll so the history can leave the screen
-    // and the final hot-search row can settle just above the fixed search bar.
-    val visibleBoardItems = if (pager.currentPage == 0) standardItems else personal.items
-    val boardHeight = if (visibleBoardItems.isNotEmpty()) {
-        41.dp * visibleBoardItems.size.toFloat() + 16.dp
-    } else 100.dp
+    // The outer LazyColumn owns vertical scrolling. Measure the board from its rows
+    // instead of centering them inside an estimated height that varies from the text layout.
     Column(Modifier.fillMaxWidth()) {
         val progress = (pager.currentPage + pager.currentPageOffsetFraction).coerceIn(0f, 1f)
         Box(Modifier.fillMaxWidth().height(34.dp)) {
@@ -23127,8 +23214,12 @@ private fun HotSearchBoards(
             Box(Modifier.align(Alignment.BottomStart).offset(x = 0.dp + 60.dp * progress)
                 .width(34.dp).height(3.dp).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(50)))
         }
-        HorizontalPager(state = pager, beyondViewportPageCount = 1,
-            modifier = Modifier.fillMaxWidth().height(boardHeight)) { page ->
+        // Offscreen pages must not add scrollable height to a shorter, settled board.
+        HorizontalPager(
+            state = pager,
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Top,
+        ) { page ->
             val items = if (page == 0) standardItems else personal.items
             val loading = if (page == 0) standardLoading ||
                 standardItems.isEmpty() && standardError == null && refreshGeneration == 0
@@ -23287,7 +23378,11 @@ private fun UserPostsSearchScreen(
             }
             else -> LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().feedScrollIndicator(
+                    state = listState,
+                    bottomInset = 88.dp,
+                    enabled = posts.isNotEmpty(),
+                ),
                 contentPadding = PaddingValues(bottom = 88.dp),
             ) {
                 if (posts.isEmpty() && hasMore) item {
@@ -23994,7 +24089,12 @@ private fun SearchScreen(
                     LazyColumn(
                         state = if (activeQuery == null) hotListState else listState,
                         flingBehavior = rememberWeiboListFlingBehavior(),
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier.fillMaxSize().feedScrollIndicator(
+                            state = listState,
+                            topInset = topInset + 4.dp,
+                            bottomInset = listBottomInset,
+                            enabled = activeQuery != null && activeSearchMode == SearchMode.Weibo && resultItems.isNotEmpty(),
+                        ),
                         contentPadding = PaddingValues(
                             top = topInset + if (activeQuery == null) 8.dp else 4.dp,
                             start = if (activeQuery == null) 16.dp else 0.dp,
@@ -24059,7 +24159,7 @@ private fun SearchScreen(
                     }
                     item(key = "hot-search-boards") {
                         HotSearchBoards(
-                            session = session,
+                            loadPersonal = session::loadPersonalHotSearch,
                             pager = hotBoardPager,
                             personal = personalHotBoard,
                             standardItems = hotSearchItems,
@@ -25189,7 +25289,11 @@ private fun MineScreen(
                             LazyColumn(
                                 state = postsListState,
                                 flingBehavior = rememberWeiboListFlingBehavior(),
-                                modifier = Modifier.fillMaxSize(),
+                                modifier = Modifier.fillMaxSize().feedScrollIndicator(
+                                    state = postsListState,
+                                    bottomInset = 96.dp,
+                                    enabled = posts.isNotEmpty(),
+                                ),
                                 contentPadding = PaddingValues(bottom = 96.dp),
                             ) {
                                 if (posts.isEmpty()) {
@@ -25455,6 +25559,30 @@ private fun SettingsPageShell(
 }
 
 @Composable
+internal fun SettingsList(
+    topContentPadding: Dp = 12.dp,
+    content: LazyListScope.(bottomContentPadding: Dp) -> Unit,
+) {
+    // The scaffold is edge-to-edge. Keep the viewport behind the floating dock,
+    // and reserve the dock and its navigation-bar lift only at the end of the list.
+    val bottomContentPadding = 12.dp + SettingsBottomBarInset +
+        WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    LazyColumn(
+        flingBehavior = rememberWeiboListFlingBehavior(),
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(
+            start = 16.dp,
+            top = topContentPadding,
+            end = 16.dp,
+            bottom = bottomContentPadding,
+        ),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        content(this, bottomContentPadding)
+    }
+}
+
+@Composable
 private fun SettingsScreen(
     hasLoginCookie: Boolean,
     accounts: List<StoredWeiboAccount>,
@@ -25516,19 +25644,7 @@ private fun SettingsScreen(
         } else {
             val homeTimeline = LocalHomeTimelineReadingState.current
             val reading = homeTimeline?.preferences ?: ReadingPreferences()
-            LazyColumn(
-                flingBehavior = rememberWeiboListFlingBehavior(),
-                modifier = Modifier.fillMaxSize().padding(
-                    bottom = SettingsBottomBarInset + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding(),
-                ),
-                contentPadding = PaddingValues(
-                    start = 16.dp,
-                    top = 12.dp,
-                    end = 16.dp,
-                    bottom = 12.dp,
-                ),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
+            SettingsList { bottomContentPadding ->
                 item {
                     SettingsAccountCard(
                         expanded = accountExpanded,
@@ -25638,7 +25754,7 @@ private fun SettingsScreen(
                 }
                 item { SettingsCacheCard() }
                 item {
-                    SettingsAboutCard(versionName = versionName)
+                    SettingsAboutCard(versionName = versionName, bottomContentPadding = bottomContentPadding)
                 }
             }
         }
@@ -25798,18 +25914,20 @@ private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
 }
 
 @Composable
-private fun SettingsAboutCard(versionName: String) {
+internal fun SettingsAboutCard(versionName: String, bottomContentPadding: Dp) {
     val context = LocalContext.current
     var expanded by remember { mutableStateOf(false) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
     val actionsBringIntoView = remember { BringIntoViewRequester() }
-    var actionsHeight by remember { mutableIntStateOf(0) }
-    LaunchedEffect(expanded, actionsHeight, updateMessage) {
-        if (expanded && actionsHeight > 0) {
-            // Wait for the expanded/result layout, then reveal the entire action
-            // area through the owning LazyColumn rather than requiring a new swipe.
+    var actionsSize by remember { mutableStateOf(IntSize.Zero) }
+    val bottomContentPaddingPx = with(LocalDensity.current) { bottomContentPadding.toPx() }
+    LaunchedEffect(expanded, actionsSize, bottomContentPaddingPx, updateMessage) {
+        if (expanded && actionsSize.height > 0) {
+            // Include the inset: the actions can be inside the viewport but behind the dock.
             withFrameNanos { }
-            actionsBringIntoView.bringIntoView()
+            actionsBringIntoView.bringIntoView(
+                Rect(0f, 0f, actionsSize.width.toFloat(), actionsSize.height + bottomContentPaddingPx),
+            )
         }
     }
     fun openGitHub(url: String) {
@@ -25854,7 +25972,7 @@ private fun SettingsAboutCard(versionName: String) {
         if (expanded) {
         Column(Modifier.fillMaxWidth()
             .bringIntoViewRequester(actionsBringIntoView)
-            .onSizeChanged { actionsHeight = it.height }) {
+            .onSizeChanged { actionsSize = it }) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -25875,17 +25993,7 @@ private fun SettingsAboutCard(versionName: String) {
 
 @Composable
 private fun SettingsHelpContent() {
-    LazyColumn(
-        flingBehavior = rememberWeiboListFlingBehavior(),
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(
-            start = 16.dp,
-            top = 4.dp,
-            end = 16.dp,
-            bottom = SettingsBottomBarInset,
-        ),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
+    SettingsList(topContentPadding = 4.dp) {
         appHelpSections.forEach { section ->
             item {
                 SettingsHelpSectionCard(section = section)
@@ -27358,6 +27466,7 @@ private fun ProfileCoverBanner(
                     RemoteImage(
                         url = image.largeUrl,
                         fallbackUrls = image.downloadUrls.drop(1),
+                        profileCover = true,
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Crop,
                     )
@@ -27383,6 +27492,7 @@ private fun ProfileCoverBanner(
                         RemoteImage(
                             url = image.largeUrl,
                             fallbackUrls = image.downloadUrls.drop(1),
+                            profileCover = true,
                             modifier = Modifier.fillMaxSize(),
                             contentScale = ContentScale.Crop,
                         )
@@ -29818,6 +29928,7 @@ private fun RemoteImage(
     stableThumbnailKey: String? = null,
     retainPreviousImage: Boolean = false,
     imageIdentity: String? = null,
+    profileCover: Boolean = false,
 ) {
     if (animated) {
         AnimatedRemoteImage(
@@ -29876,12 +29987,14 @@ private fun RemoteImage(
                             loadRemoteBitmap(
                                 url = candidateUrl,
                                 maxDecodeDim = maxDecodeDim,
+                                profileCover = profileCover,
                             )
                         }
                     } else {
                         loadRemoteBitmap(
                             url = candidateUrl,
                             maxDecodeDim = maxDecodeDim,
+                            profileCover = profileCover,
                         )
                     }
                 }
@@ -30361,7 +30474,9 @@ private fun fetchRemoteBytes(
     readTimeoutMs: Int,
     maxReadBytes: Int = RemoteBytesMaxCachedEntry,
     forceNetwork: Boolean = false,
+    profileCover: Boolean = false,
 ): ByteArray {
+    if (profileCover) require(ProfileCoverUrls.isAllowed(url))
     if (!forceNetwork) {
         RemoteBytesCache.get(url)?.takeIf { it.size <= maxReadBytes }?.let { return it }
         RemoteDiskBytesCache.get(url, maxReadBytes)?.let { bytes ->
@@ -30369,8 +30484,9 @@ private fun fetchRemoteBytes(
             return bytes
         }
     }
-    val request = weiboImageRequest(url)
-    val call = WeiboImageHttpClient.newCall(request).apply {
+    val request = weiboImageRequest(url, includeWeiboCookie = !profileCover)
+    val client = if (profileCover) ProfileCoverHttpClient else WeiboImageHttpClient
+    val call = client.newCall(request).apply {
         timeout().timeout((connectTimeoutMs + readTimeoutMs).toLong(), TimeUnit.MILLISECONDS)
     }
     val bytes = call.execute().use { response ->
@@ -30401,16 +30517,26 @@ private val WeiboImageHttpClient: OkHttpClient by lazy {
         .build()
 }
 
-private fun weiboImageRequest(url: String): Request {
+// Keep profile-cover URLs on their validated CDN host, even if it returns a redirect.
+private val ProfileCoverHttpClient: OkHttpClient by lazy {
+    WeiboImageHttpClient.newBuilder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+}
+
+private fun weiboImageRequest(url: String, includeWeiboCookie: Boolean): Request {
     val builder = Request.Builder()
         .url(url)
         .header("Accept", ImageAcceptHeader)
         .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         .header("User-Agent", DESKTOP_CHROME_USER_AGENT)
         .header("Referer", "https://weibo.com/")
-    CookieManager.getInstance().getCookie("https://weibo.com/")
-        ?.takeIf { it.isNotBlank() }
-        ?.let { builder.header("Cookie", it) }
+    if (includeWeiboCookie) {
+        CookieManager.getInstance().getCookie("https://weibo.com/")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { builder.header("Cookie", it) }
+    }
     return builder.build()
 }
 
@@ -30454,6 +30580,7 @@ private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
                 maxDecodeDim = 960,
                 connectTimeoutMs = 5_000,
                 readTimeoutMs = 8_000,
+                profileCover = image.isProfileCover,
             )
         }.getOrNull()?.let { bitmap ->
             return bitmap
@@ -30477,6 +30604,7 @@ private fun loadFullscreenBitmap(image: FeedImage, forceNetwork: Boolean = false
                 readTimeoutMs = 20_000,
                 maxReadBytes = remoteReadLimitForDecodeDim(decodeDim),
                 forceNetwork = forceNetwork,
+                profileCover = image.isProfileCover,
             )
             decodeBitmapFromBytes(bytes, decodeDim)
         }.getOrNull()?.let { bitmap ->

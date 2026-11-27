@@ -819,17 +819,46 @@ object WeiboJsonParser {
         )
     }
 
-    fun parseUserProfile(raw: String, fallback: JSONObject? = null): UserProfile {
+    fun parseUserProfile(raw: String): UserProfile {
         val root = JSONObject(raw)
         val data = root.optJSONObject("data") ?: root
-        val user = data.optJSONObject("user")
-            ?: data.optJSONObject("userInfo")
-            ?: data
+        return parseUserProfile(data, profileUser(data))
+    }
+
+    internal fun parseCurrentProfileCandidate(
+        raw: String,
+        requestedUid: String,
+        config: JSONObject,
+    ): CurrentProfileCandidate {
+        val root = JSONObject(raw)
+        check(!root.has("ok") || root.optInt("ok", -1) == 1) { "微博用户资料接口拒绝请求" }
+        val data = if (root.has("data")) {
+            checkNotNull(root.optJSONObject("data")) { "微博用户资料结构无效" }
+        } else root
+        val user = if (data.has("user") || data.has("userInfo")) {
+            checkNotNull(data.optJSONObject("user") ?: data.optJSONObject("userInfo")) { "微博用户资料结构无效" }
+        } else data
+        val ids = listOfNotNull(user.optNullableString("idstr"), user.optNullableString("id"))
+        check(ids.isNotEmpty()) { "微博用户资料缺少 UID" }
+        check(ids.all { it == requestedUid }) { "登录状态与当前选中账号不一致，请重新登录该账号" }
+        val profile = parseUserProfile(data, user, config)
+        val coverState = when {
+            profile.coverUrls.isNotEmpty() -> ProfileCoverState.Available
+            profileCoverFields.none(user::has) -> ProfileCoverState.Omitted
+            profileCoverFields.filter(user::has).all { key ->
+                user.isNull(key) || (user.opt(key) as? String)?.isBlank() == true
+            } -> ProfileCoverState.Cleared
+            else -> ProfileCoverState.Invalid
+        }
+        return CurrentProfileCandidate(profile, coverState)
+    }
+
+    private fun profileUser(data: JSONObject): JSONObject =
+        data.optJSONObject("user") ?: data.optJSONObject("userInfo") ?: data
+
+    private fun parseUserProfile(data: JSONObject, user: JSONObject, fallback: JSONObject? = null): UserProfile {
         return UserProfile(
-            id = user.optNullableString("idstr")
-                ?: user.optNullableString("id")
-                ?: fallback?.optNullableString("uid")
-                ?: "",
+            id = user.optNullableString("idstr") ?: user.optNullableString("id") ?: "",
             screenName = user.optNullableString("screen_name")
                 ?: user.optNullableString("name")
                 ?: fallback?.optNullableString("screen_name")
@@ -988,52 +1017,25 @@ object WeiboJsonParser {
         return formatCount((count + delta).coerceAtLeast(0))
     }
 
+    private val profileCoverFields = listOf("cover_image_phone", "cover_image")
+
     fun profileCoverImages(urls: List<String>): List<FeedImage> =
-        urls.map { url ->
-            val downloadUrls = profileCoverDownloadUrls(url)
+        ProfileCoverUrls.normalize(urls).mapNotNull { url ->
+            val downloadUrls = ProfileCoverUrls.downloadCandidates(url)
+            val original = downloadUrls.firstOrNull() ?: return@mapNotNull null
             FeedImage(
-                id = url,
-                thumbnailUrl = downloadUrls.first(),
-                largeUrl = downloadUrls.first(),
+                id = original.substringBefore('?').substringBefore('#'),
+                thumbnailUrl = original,
+                largeUrl = original,
                 downloadUrls = downloadUrls,
+                isProfileCover = true,
             )
         }
 
-    private fun parseProfileCoverUrls(user: JSONObject): List<String> {
-        val rawValues = listOfNotNull(
-            user.optNullableString("cover_image_phone"),
-            user.optNullableString("cover_image"),
-        )
-        return rawValues
-            .flatMap { raw -> raw.split(';') }
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-            .map(::normalizeProfileCoverUrl)
-            .distinct()
-    }
-
-    private fun normalizeProfileCoverUrl(url: String): String {
-        var normalized = url.trim()
-        if (normalized.startsWith("//")) normalized = "https:$normalized"
-        if (normalized.startsWith("http://")) {
-            normalized = normalized.replaceFirst("http://", "https://")
-        }
-        normalized = normalized.substringBefore('?')
-        normalized = normalized.replace(Regex("""crop\.\d+\.\d+\.\d+\.\d+"""), "mw2000")
-        return normalized
-    }
-
-    private fun profileCoverDownloadUrls(url: String): List<String> {
-        val normalized = normalizeProfileCoverUrl(url)
-        val match = Regex("""(https?://[^/]+)/([^/]+)/(.+)""").find(normalized)
-        if (match == null) return listOf(normalized)
-        val host = match.groupValues[1]
-        val path = match.groupValues[3]
-        return listOf("mw2000", "woriginal", "large", "orj960", "bmiddle")
-            .map { size -> "$host/$size/$path" }
-            .distinct()
-            .filter(::looksLikeImageUrl)
-    }
+    private fun parseProfileCoverUrls(user: JSONObject): List<String> =
+        profileCoverFields.flatMap { key ->
+            (user.opt(key) as? String)?.let(ProfileCoverUrls::parseField).orEmpty()
+        }.distinct()
 
     data class ImageWallParseResult(
         val images: List<FeedImage>,

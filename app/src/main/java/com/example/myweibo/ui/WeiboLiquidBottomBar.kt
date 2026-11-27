@@ -82,7 +82,8 @@ internal data class ViboDockRuntime(
     val catalogue: List<ViboDockEntry>,
     val selectedEntryId: String? = null,
     val onEntrySelected: (ViboDockEntry) -> Unit,
-    val profileAvatarUrl: String?,
+    val profileAvatar: ViboDockAvatarRequest?,
+    val onEntryDoubleClick: ((ViboDockEntry) -> Unit)? = null,
 )
 
 @Composable
@@ -192,13 +193,19 @@ internal fun WeiboLiquidBottomBar(
                 onTimelineMenuExpandedChange(false)
                 onTabChange(tab)
             },
+            onTimelineDoubleClick = dockRuntime?.onEntryDoubleClick?.let { refresh ->
+                { entry ->
+                    if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
+                    refresh(entry)
+                }
+            },
             onTimelineLongPress = { entry ->
                 menuAnchorEntryId = entry.id
                 onTimelineMenuExpandedChange(true)
             },
             showLabels = dockPreferences.showLabels,
             unreadMessagesCount = unreadMessagesCount,
-            profileAvatarUrl = dockRuntime?.profileAvatarUrl,
+            profileAvatar = dockRuntime?.profileAvatar,
             endcapSize = endcapSize,
             availableCapsuleWidth = availableCapsuleWidth,
             capsuleWidth = capsuleWidth,
@@ -253,10 +260,11 @@ private fun ViboDock(
     homeLabel: String,
     onEntrySelected: (ViboDockEntry) -> Unit,
     onEndcapSelected: (MainTab) -> Unit,
+    onTimelineDoubleClick: ((ViboDockEntry) -> Unit)?,
     onTimelineLongPress: (ViboDockEntry) -> Unit,
     showLabels: Boolean,
     unreadMessagesCount: Int,
-    profileAvatarUrl: String?,
+    profileAvatar: ViboDockAvatarRequest?,
     endcapSize: Dp,
     availableCapsuleWidth: Dp,
     capsuleWidth: Dp,
@@ -307,6 +315,8 @@ private fun ViboDock(
                         tabsCount = entries.size,
                         isTabLongPressEnabled = { entries[it].isTimelineSlot() },
                         onTabLongPress = { onTimelineLongPress(entries[it]) },
+                        onTabDoubleClick = onTimelineDoubleClick?.let { callback -> { index -> callback(entries[index]) } },
+                        isTabDoubleClickEnabled = { entries[it].isTimelineSlot() },
                         height = DockHeight,
                         dragSelectionEnabled = !scrollable,
                         modifier = Modifier.width(capsuleWidth),
@@ -321,6 +331,8 @@ private fun ViboDock(
                                 selected = index == selectedIndex,
                                 onClick = { onEntrySelected(entry) },
                                 onLongClick = if (entry.isTimelineSlot()) ({ onTimelineLongPress(entry) }) else null,
+                                onDoubleClick = onTimelineDoubleClick?.takeIf { scrollable && entry.isTimelineSlot() }
+                                    ?.let { callback -> { callback(entry) } },
                                 modifier = Modifier.semantics {
                                     contentDescription = entry.title
                                     if (isHome && homeLabel != entry.title) stateDescription = homeLabel
@@ -364,17 +376,16 @@ private fun ViboDock(
             }
         }
 
-        LiquidDockSearchButton(
+        ViboDockAvatar(
+            request = profileAvatar,
+            contentColor = contentColor,
             selected = selectedTab == MainTab.Mine,
             onClick = { onEndcapSelected(MainTab.Mine) },
             backdrop = backdrop,
             frostAmount = frostAmount,
             glassAmount = glassAmount,
-            forceDarkSurface = darkSurfaceOverride,
-            modifier = Modifier.size(endcapSize).semantics { contentDescription = MainTab.Mine.label },
-        ) {
-            ViboDockAvatar(profileAvatarUrl, contentColor, selected = selectedTab == MainTab.Mine)
-        }
+            modifier = Modifier.size(endcapSize),
+        )
     }
 }
 

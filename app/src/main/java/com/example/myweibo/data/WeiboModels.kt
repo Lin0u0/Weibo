@@ -99,6 +99,7 @@ data class FeedImage(
     val shootTime: String? = null,
     val cameraMake: String? = null,
     val cameraModel: String? = null,
+    val isProfileCover: Boolean = false,
 ) {
     val isLivePhoto: Boolean
         get() = !livePhotoVideoUrl.isNullOrBlank() && !isGif

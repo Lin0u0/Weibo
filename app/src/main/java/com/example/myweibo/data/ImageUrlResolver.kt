@@ -52,11 +52,14 @@ object ImageUrlResolver {
         return url.replace(SinaimgVariantPattern, "/$variant/")
     }
 
-    fun feedBitmapCandidates(image: FeedImage): List<String> =
+    fun feedBitmapCandidates(image: FeedImage): List<String> = if (image.isProfileCover) {
+        fullscreenCandidates(image)
+    } else {
         (listOf(image.thumbnailUrl, withSinaimgVariant(image.largeUrl, "mw690")) +
             image.downloadUrls.map { withSinaimgVariant(it, "mw690") })
             .filter { it.isNotBlank() }
             .distinct()
+    }
 
     fun feedDisplayCandidates(
         image: FeedImage,
@@ -70,6 +73,7 @@ object ImageUrlResolver {
             .distinct()
 
     fun fullscreenCandidates(image: FeedImage): List<String> {
+        if (image.isProfileCover) return image.downloadUrls.filter(ProfileCoverUrls::isAllowed)
         val highQuality = (image.downloadUrls + listOf(image.largeUrl))
             .filter { it.isNotBlank() }
             .distinct()
@@ -84,7 +88,9 @@ object ImageUrlResolver {
     fun saveCandidates(image: FeedImage): List<String> =
         fullscreenCandidates(image)
 
-    fun albumGridCandidates(image: FeedImage): List<String> = buildList {
+    fun albumGridCandidates(image: FeedImage): List<String> = if (image.isProfileCover) {
+        fullscreenCandidates(image)
+    } else buildList {
         image.thumbnailUrl.takeIf { it.isNotBlank() }
             ?.let(::downgradeForAlbumGrid)
             ?.let(::add)

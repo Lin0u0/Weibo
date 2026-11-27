@@ -63,7 +63,7 @@ object ImageSaveHelper {
 
     suspend fun loadBytes(image: FeedImage): ByteArray? = withContext(Dispatchers.IO) {
         ImageUrlResolver.saveCandidates(image).firstNotNullOfOrNull { url ->
-            runCatching { downloadBytes(url) }.getOrNull()
+            runCatching { downloadBytes(url = url, followRedirects = !image.isProfileCover) }.getOrNull()
         }
     }
 
@@ -72,6 +72,7 @@ object ImageSaveHelper {
         runCatching {
             val connection = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "HEAD"
+                if (image.isProfileCover) instanceFollowRedirects = false
                 connectTimeout = 8_000
                 readTimeout = 8_000
                 setRequestProperty("User-Agent", USER_AGENT)
@@ -612,6 +613,7 @@ object ImageSaveHelper {
         maxBytes: Int = 32 * 1024 * 1024,
         includeWeiboCookie: Boolean = false,
         maxDurationMs: Long = PER_IMAGE_DOWNLOAD_MAX_DURATION_MS,
+        followRedirects: Boolean = true,
         onProgress: ((downloaded: Long, total: Long) -> Unit)? = null,
     ): ByteArray {
         var lastError: Exception? = null
@@ -620,6 +622,7 @@ object ImageSaveHelper {
                 val connection = (URL(url).openConnection() as HttpURLConnection).apply {
                     connectTimeout = PER_DOWNLOAD_CONNECT_TIMEOUT_MS
                     readTimeout = PER_DOWNLOAD_READ_TIMEOUT_MS
+                    if (!followRedirects) instanceFollowRedirects = false
                     applyWeiboRequestHeaders(includeWeiboCookie)
                 }
                 val totalBytes = connection.contentLengthLong.takeIf { it > 0L } ?: -1L
@@ -662,9 +665,6 @@ object ImageSaveHelper {
             setRequestProperty("Cookie", it)
         }
     }
-
-    private fun downloadBytes(url: String): ByteArray =
-        downloadBytes(url = url, maxBytes = 32 * 1024 * 1024)
 
     private fun applySaveMetadata(
         context: Context,

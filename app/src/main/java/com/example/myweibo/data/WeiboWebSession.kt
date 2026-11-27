@@ -1291,23 +1291,29 @@ class WeiboWebSession(context: Context) {
         return enrichUserProfileWithDetail(WeiboJsonParser.parseUserProfile(raw))
     }
 
-    suspend fun loadCurrentUserProfile(): UserProfile {
+    suspend fun loadCurrentUserProfile(): UserProfile = loadCurrentUserProfileCandidate().profile
+
+    internal suspend fun loadCurrentUserProfileCandidate(expectedAccountId: String? = null): CurrentProfileCandidate {
         val config = loadCurrentUserConfig()
-        val uid = config.optString("uid").takeIf { it.isNotBlank() && it != "0" }
-            ?: throw IllegalStateException("\u672A\u8BFB\u5230\u5F53\u524D\u767B\u5F55\u7528\u6237 UID\uFF0C\u8BF7\u5148\u5B8C\u6210\u5FAE\u535A\u767B\u5F55")
-        val raw = runCatching {
-            fetchJson(
-                WeiboEndpoints.PROFILE_INFO,
-                linkedMapOf("uid" to uid),
-            )
-        }.getOrElse {
-            nativeFetchAbsoluteJson(
-                url = "https://m.weibo.cn/api/container/getIndex?type=uid&value=${uid.urlEncode()}",
-                referer = "https://m.weibo.cn/u/$uid",
-                origin = "https://m.weibo.cn",
-            )
+        val uid = config.optString("uid").takeIf { id ->
+            id.isNotBlank() && id != "0" && id.all { it in '0'..'9' }
+        } ?: throw IllegalStateException("\u672A\u8BFB\u5230\u5F53\u524D\u767B\u5F55\u7528\u6237 UID\uFF0C\u8BF7\u5148\u5B8C\u6210\u5FAE\u535A\u767B\u5F55")
+        check(expectedAccountId == null || uid == expectedAccountId) {
+            "登录状态与当前选中账号不一致，请重新登录该账号"
         }
-        return enrichUserProfileWithDetail(WeiboJsonParser.parseUserProfile(raw, config))
+        val candidate = selectCurrentProfileCandidate(
+            requestedUid = uid,
+            config = config,
+            fetchDesktop = { fetchJson(WeiboEndpoints.PROFILE_INFO, linkedMapOf("uid" to uid)) },
+            fetchMobile = {
+                nativeFetchAbsoluteJson(
+                    url = "https://m.weibo.cn/api/container/getIndex?type=uid&value=${uid.urlEncode()}",
+                    referer = "https://m.weibo.cn/u/$uid",
+                    origin = "https://m.weibo.cn",
+                )
+            },
+        )
+        return candidate.copy(profile = enrichUserProfileWithDetail(candidate.profile))
     }
 
     private suspend fun enrichUserProfileWithDetail(profile: UserProfile): UserProfile {

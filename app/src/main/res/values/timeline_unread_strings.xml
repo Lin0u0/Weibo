@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="timeline_unread_count">%1$d 条未读</string>
+    <string name="timeline_unread_count_accessibility">当前时间线有 %1$d 条未读微博</string>
+</resources>

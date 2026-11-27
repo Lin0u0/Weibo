@@ -46,6 +46,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -120,6 +121,8 @@ internal fun Modifier.drawBottomBarGlassBackdrop(
     )
 }
 
+private data class PendingDockTabTap(val index: Int, val upTimeMillis: Long)
+
 @Composable
 fun LiquidBottomTabs(
     selectedTabIndex: () -> Int,
@@ -138,6 +141,8 @@ fun LiquidBottomTabs(
     height: Dp = 64.dp,
     dragSelectionEnabled: Boolean = true,
     isTabLongPressEnabled: ((index: Int) -> Boolean)? = null,
+    onTabDoubleClick: ((index: Int) -> Unit)? = null,
+    isTabDoubleClickEnabled: (index: Int) -> Boolean = { true },
     content: @Composable RowScope.() -> Unit,
 ) {
     require(tabsCount > 0)
@@ -183,6 +188,8 @@ fun LiquidBottomTabs(
         val currentMaxHeight = rememberUpdatedState(constraints.maxHeight)
         val currentOnTabSelected = rememberUpdatedState(onTabSelected)
         val currentOnTabLongPress = rememberUpdatedState(onTabLongPress)
+        val currentOnTabDoubleClick = rememberUpdatedState(onTabDoubleClick)
+        val currentIsTabDoubleClickEnabled = rememberUpdatedState(isTabDoubleClickEnabled)
         fun valueAt(position: Offset): Float {
             val visualValue = (
                 (position.x - horizontalPaddingPx) / currentTabWidth.value - 0.5f
@@ -258,6 +265,15 @@ fun LiquidBottomTabs(
             if (targetIndex != currentSelectedIndex.value) {
                 currentOnTabSelected.value(targetIndex)
             }
+            animationScope.launch {
+                offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
+            }
+        }
+
+        fun selectTappedTab(index: Int) {
+            dampedDragAnimation.animateToValue(index.toFloat())
+            // A tap also activates an already-selected tab, unlike a drag settling on it.
+            currentOnTabSelected.value(index)
             animationScope.launch {
                 offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
             }
@@ -538,12 +554,33 @@ fun LiquidBottomTabs(
                         isLtr,
                         tabWidth,
                     ) {
+                        var pendingTap: PendingDockTabTap? = null
                         awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
+                            // Use the pointer-event timeout (same as long press) rather than a
+                            // separately scheduled coroutine that can race the next gesture.
+                            var previousTap = pendingTap
+                            pendingTap = null
+                            val nextDown = if (previousTap != null) {
+                                withTimeoutOrNull(viewConfiguration.doubleTapTimeoutMillis) {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                }
+                            } else null
+                            if (nextDown == null && previousTap != null) {
+                                selectTappedTab(previousTap.index)
+                                previousTap = null
+                            }
+                            val down = nextDown ?: awaitFirstDown(requireUnconsumed = false)
                             down.consume()
+                            val targetIndex = indexAt(down.position)
+                            val canDoubleTap = down.type == PointerType.Touch &&
+                                currentOnTabDoubleClick.value != null && currentIsTabDoubleClickEnabled.value(targetIndex)
+                            val isSecondTap = previousTap != null && canDoubleTap && previousTap.index == targetIndex &&
+                                down.uptimeMillis - previousTap.upTimeMillis in
+                                viewConfiguration.doubleTapMinTimeMillis..viewConfiguration.doubleTapTimeoutMillis
+                            if (previousTap != null && !isSecondTap) selectTappedTab(previousTap.index)
                             dampedDragAnimation.press()
                             var latestPosition = down.position
-                            var releasedBeforeLongPress = false
+                            var releasedAt: Long? = null
                             var movedBeforeLongPress = false
                             val completedBeforeTimeout = withTimeoutOrNull(
                                 viewConfiguration.longPressTimeoutMillis,
@@ -551,13 +588,13 @@ fun LiquidBottomTabs(
                                 while (true) {
                                     val event = awaitPointerEvent()
                                     val change = event.changes.firstOrNull { it.id == down.id }
-                                        ?: event.changes.firstOrNull()
-                                        ?: run {
-                                            return@withTimeoutOrNull true
-                                        }
+                                        ?: return@withTimeoutOrNull true
+                                    if (change.isConsumed || event.changes.any { it.id != down.id && it.pressed }) {
+                                        return@withTimeoutOrNull true
+                                    }
                                     latestPosition = change.position
                                     if (!change.pressed) {
-                                        releasedBeforeLongPress = true
+                                        releasedAt = change.uptimeMillis
                                         change.consume()
                                         return@withTimeoutOrNull true
                                     }
@@ -572,23 +609,29 @@ fun LiquidBottomTabs(
                             } != null
 
                             if (completedBeforeTimeout) {
-                                if (releasedBeforeLongPress) {
-                                    val targetIndex = indexAt(down.position)
-                                    dampedDragAnimation.animateToValue(targetIndex.toFloat())
-                                    // A tap also activates the already-selected tab; a drag settling
-                                    // on it does not. Read the latest callback without restarting input.
-                                    currentOnTabSelected.value(targetIndex)
-                                    animationScope.launch {
-                                        offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
+                                val upTime = releasedAt
+                                if (upTime != null) {
+                                    when {
+                                        isSecondTap -> {
+                                            cancelControlledGesture()
+                                            currentOnTabDoubleClick.value?.invoke(targetIndex)
+                                        }
+                                        canDoubleTap -> {
+                                            cancelControlledGesture()
+                                            pendingTap = PendingDockTabTap(targetIndex, upTime)
+                                        }
+                                        else -> selectTappedTab(targetIndex)
                                     }
                                     return@awaitEachGesture
                                 }
                                 if (!movedBeforeLongPress) {
+                                    if (isSecondTap) selectTappedTab(targetIndex)
                                     dampedDragAnimation.release()
                                     return@awaitEachGesture
                                 }
                             }
 
+                            if (isSecondTap) selectTappedTab(targetIndex)
                             val openedMenu = beginControlledGesture(
                                 position = latestPosition,
                                 showLongPressMenu = !completedBeforeTimeout,

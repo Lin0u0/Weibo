@@ -37,12 +37,13 @@ fun RowScope.LiquidBottomTab(
     selected: Boolean,
     modifier: Modifier = Modifier,
     onLongClick: (() -> Unit)? = null,
+    onDoubleClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val tabModifier = if (LocalLiquidBottomTabIsSample.current) {
         Modifier
     } else {
-        val action = if (onLongClick == null) {
+        val action = if (onLongClick == null && onDoubleClick == null) {
             Modifier.selectable(
                 selected = selected,
                 interactionSource = null,
@@ -59,6 +60,7 @@ fun RowScope.LiquidBottomTab(
                     role = Role.Tab,
                     onClick = onClick,
                     onLongClick = onLongClick,
+                    onDoubleClick = onDoubleClick,
                 )
         }
         modifier.clip(RoundedCornerShape(percent = 50)).then(action)
