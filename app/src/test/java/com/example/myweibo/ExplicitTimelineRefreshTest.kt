@@ -2,14 +2,13 @@ package com.example.myweibo
 
 import com.example.myweibo.data.FeedItem
 import com.example.myweibo.data.TimelineKind
-import com.example.myweibo.data.TimelineReadingAnchor
-import com.example.myweibo.data.TimelineReadingScope
-import com.example.myweibo.data.TimelineRefreshReadingBatch
-import com.example.myweibo.data.advanceTimelineReadingAnchor
+import com.example.myweibo.data.TimelineRefreshPostIdentity
+import com.example.myweibo.data.TimelineRefreshRoute
+import com.example.myweibo.data.ConfirmedTimelineRefresh
 import com.example.myweibo.data.classifyExplicitTimelineRefresh
 import com.example.myweibo.data.countNewTimelinePosts
 import com.example.myweibo.data.hasChronologicalResponse
-import com.example.myweibo.data.isTimelineRowMeaningfullyVisible
+import com.example.myweibo.data.mergeFeedTimelineRefresh
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -17,43 +16,15 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class TimelineReadingBoundaryTest {
-    @Test fun flingAndCollapsedRowsCannotSkipReadFrontier() {
-        val pin = post(90).copy(isPinned = true)
-        val rows = listOf(post(5), post(4), pin, post(3), post(2), post(1))
-        val read = anchor(2)
-        assertEquals(read, advanceTimelineReadingAnchor(read, rows, setOf("row-5", "row-4", pin.id)))
-        assertEquals(anchor(3), advanceTimelineReadingAnchor(read, rows, setOf("row-5", "row-3")))
-        assertEquals(anchor(4), advanceTimelineReadingAnchor(read, rows, setOf("row-4", "row-3")))
-        assertEquals(read, advanceTimelineReadingAnchor(read, rows, setOf("row-1")))
-    }
-
-    @Test fun firstObservationMustQualifyOrdinaryHeadAndDisjointRefreshIsNotContinuity() {
-        val rows = listOf(post(90).copy(isPinned = true), post(5), post(4), post(3), post(2))
-        assertNull(advanceTimelineReadingAnchor(null, rows, setOf("row-90", "row-4")))
-        assertEquals(anchor(5), advanceTimelineReadingAnchor(null, rows, setOf("row-5")))
-        assertEquals(anchor(3), advanceTimelineReadingAnchor(anchor(2), rows, setOf("row-3", "row-4"), setOf(anchor(3))))
-    }
-
-    @Test fun missingAnchorIsRetainedUntilExactIdentityReappearsUnpinned() {
-        val read = anchor(2)
-        val rows = listOf(post(4), post(3))
-        assertEquals(read, advanceTimelineReadingAnchor(read, rows, setOf("row-4", "row-3")))
-        val alias = post(2).copy(id = "cold-alias")
-        assertEquals(read, advanceTimelineReadingAnchor(read, rows + alias.copy(isPinned = true), setOf("row-3")))
-        assertEquals(anchor(3), advanceTimelineReadingAnchor(read, rows + alias, setOf("row-3")))
-    }
-
-    @Test fun routeKeysSeparateAccountsGroupsAndBuiltInSpecialFollowing() {
-        fun key(account: String, kind: TimelineKind, group: String? = null) =
-            requireNotNull(TimelineReadingScope.of(account, kind, group)).storageKey
-        val following = key("123", TimelineKind.Following)
-        assertNotEquals(following, key("124", TimelineKind.Following))
-        assertNotEquals(following, key("123", TimelineKind.FriendsCircle))
-        assertNotEquals(key("123", TimelineKind.SpecialFollowing), key("123", TimelineKind.SpecialFollowing, "one"))
-        assertNotEquals(key("123", TimelineKind.SpecialFollowing, "one"), key("123", TimelineKind.SpecialFollowing, "two"))
-        assertNull(TimelineReadingScope.of(null, TimelineKind.Following, null))
-        assertNull(TimelineReadingScope.of("123", TimelineKind.Hot, null))
+class ExplicitTimelineRefreshTest {
+    @Test fun refreshVerificationSeparatesAccountsGroupsAndBuiltInSpecialFollowing() {
+        fun route(account: String, kind: TimelineKind, group: String? = null) =
+            requireNotNull(TimelineRefreshRoute.of(account, kind, group))
+        assertNotEquals(route("123", TimelineKind.Following), route("456", TimelineKind.Following))
+        assertNotEquals(route("123", TimelineKind.SpecialFollowing), route("123", TimelineKind.SpecialFollowing, "9"))
+        assertNotEquals(route("123", TimelineKind.SpecialFollowing, "9"), route("123", TimelineKind.SpecialFollowing, "10"))
+        assertNull(TimelineRefreshRoute.of(null, TimelineKind.Following, null))
+        assertNull(TimelineRefreshRoute.of("123", TimelineKind.Hot, null))
     }
 
     @Test fun standaloneSpecialNeedsARealChronologicalResponse() {
@@ -86,7 +57,7 @@ class TimelineReadingBoundaryTest {
         assertEquals(0, countNewTimelinePosts(previous, listOf(head, undated), ordered = true))
     }
 
-    @Test fun explicitRefreshUsesThePreRequestHeadNotTheReadFrontier() {
+    @Test fun explicitRefreshUsesThePreRequestHead() {
         // Newest first: old B/A/R, then fetch new D/C followed by B. A/B are not in the new batch.
         val previous = listOf(post(6), post(5), post(4), post(2))
         val oldHeadAlias = post(6).copy(id = "response-alias-for-B")
@@ -94,12 +65,43 @@ class TimelineReadingBoundaryTest {
         val pin = post(90).copy(isPinned = true)
         val response = listOf(pin, newHead, newHead.copy(id = "response-alias-for-D"), post(7), oldHeadAlias, post(5))
         assertEquals(
-            TimelineRefreshReadingBatch(baseline = anchor(6), remaining = listOf(anchor(8), anchor(7))),
+            ConfirmedTimelineRefresh(baseline = anchor(6), newPosts = listOf(anchor(8), anchor(7))),
             classifyExplicitTimelineRefresh(previous, response),
         )
         assertEquals(
-            TimelineRefreshReadingBatch(baseline = anchor(6), remaining = emptyList()),
+            ConfirmedTimelineRefresh(baseline = anchor(6), newPosts = emptyList()),
             classifyExplicitTimelineRefresh(previous, listOf(pin, oldHeadAlias, post(5), post(3), post(2))),
+        )
+    }
+
+    @Test fun incomingIdentityConflictsAreRejectedBeforeRowOrStatusDeduplication() {
+        val head = post(6)
+        val previous = listOf(head, post(5))
+        val fresh = post(7)
+        val alias = fresh.copy(id = "fresh-row-alias")
+        val mergedConflict = alias.copy(statusId = post(8).statusId)
+        assertNull(classifyExplicitTimelineRefresh(previous, listOf(fresh, fresh.copy(statusId = post(8).statusId), head)))
+        assertNull(classifyExplicitTimelineRefresh(previous, listOf(fresh, alias, mergedConflict, head)))
+        assertEquals(
+            ConfirmedTimelineRefresh(baseline = anchor(6), newPosts = listOf(anchor(7))),
+            classifyExplicitTimelineRefresh(previous, listOf(fresh, alias, head)),
+        )
+    }
+
+    @Test fun sameSecondPrefixIsNewOnlyBeforeAnExactOverlappingHead() {
+        val head = post(6)
+        val previous = listOf(head, post(5))
+        val oldestNew = post(7).copy(createdAt = head.createdAt)
+        val newest = post(8).copy(createdAt = head.createdAt)
+        val headAlias = head.copy(id = "known-head-alias")
+        val page = listOf(newest, oldestNew, headAlias)
+        val batch = classifyExplicitTimelineRefresh(previous, page)
+        assertEquals(ConfirmedTimelineRefresh(baseline = anchor(6), newPosts = listOf(anchor(8), anchor(7))), batch)
+        assertEquals(listOf(newest.id, oldestNew.id, head.id, post(5).id), mergeFeedTimelineRefresh(previous, page).map { it.id })
+        assertNull(classifyExplicitTimelineRefresh(previous, page.dropLast(1)))
+        assertEquals(
+            ConfirmedTimelineRefresh(baseline = anchor(6), newPosts = emptyList()),
+            classifyExplicitTimelineRefresh(previous, listOf(headAlias, oldestNew)),
         )
     }
 
@@ -124,26 +126,12 @@ class TimelineReadingBoundaryTest {
         val unresolvedSeam = listOf(anchor(7) to anchor(6))
         assertNull(classifyExplicitTimelineRefresh(previous, previous.take(2), requiredSeams = unresolvedSeam))
         assertEquals(
-            TimelineRefreshReadingBatch(baseline = anchor(8), remaining = emptyList()),
+            ConfirmedTimelineRefresh(baseline = anchor(8), newPosts = emptyList()),
             classifyExplicitTimelineRefresh(previous, previous.take(3), requiredSeams = unresolvedSeam),
         )
     }
 
-    @Test fun explicitBatchAdvancesOnlyAcrossQualifiedAdjacentMembers() {
-        val batch = TimelineRefreshReadingBatch(baseline = anchor(6), remaining = listOf(anchor(8), anchor(7)))
-        val rows = (8 downTo 4).map(::post)
-        assertEquals(batch, batch.afterViewing(rows, setOf(post(8).id, post(6).id, post(5).id)))
-        val afterC = batch.afterViewing(rows, setOf(post(7).id))
-        assertEquals(batch.copy(remaining = listOf(anchor(8)), viewedThrough = anchor(7)), afterC)
-        assertEquals(batch.copy(remaining = emptyList(), viewedThrough = anchor(8)), afterC.afterViewing(rows, setOf(post(8).id)))
-    }
-
-    @Test fun exposedRowUsesUsableViewportForTallAndClippedRows() {
-        assertFalse(isTimelineRowMeaningfullyVisible(rowStart = -80, rowHeight = 120, viewportStart = 0, viewportEnd = 300))
-        assertTrue(isTimelineRowMeaningfullyVisible(rowStart = -80, rowHeight = 640, viewportStart = 0, viewportEnd = 300))
-    }
-
-    private fun anchor(number: Int) = requireNotNull(TimelineReadingAnchor.from(post(number)))
+    private fun anchor(number: Int) = requireNotNull(TimelineRefreshPostIdentity.from(post(number)))
 
     private fun post(number: Int) = FeedItem(
         id = "row-$number", statusId = "status-$number", authorId = "author", authorName = "Author",

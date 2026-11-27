@@ -83,7 +83,9 @@ internal data class ViboDockRuntime(
     val selectedEntryId: String? = null,
     val onEntrySelected: (ViboDockEntry) -> Unit,
     val profileAvatar: ViboDockAvatarRequest?,
+    /** Jump to the top of the selected timeline and refresh it once. */
     val onEntryDoubleClick: ((ViboDockEntry) -> Unit)? = null,
+    /** Jump to the top of the selected timeline without refreshing. */
     val onSelectedTimelineClick: (() -> Unit)? = null,
 )
 
@@ -179,37 +181,40 @@ internal fun WeiboLiquidBottomBar(
             if (target != capsuleScroll.value) capsuleScroll.scrollTo(target)
         }
 
+        val selectedEntryId = entryIds.getOrNull(selectedIndex)
+        val selectEntry: (ViboDockEntry) -> Unit = { entry ->
+            if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
+            if (entry.isTimelineSlot() && entry.id == selectedEntryId) {
+                dockRuntime?.onSelectedTimelineClick?.invoke()
+            } else if (dockRuntime != null && entry.isTimelineShortcut()) {
+                dockRuntime.onEntrySelected(entry)
+            } else {
+                onTabChange(entry.toMainTab())
+            }
+        }
         ViboDock(
             entries = entries,
             entryIds = entryIds,
             selectedTab = selectedTab,
             selectedIndex = selectedIndex,
             homeLabel = homeLabel,
-            onEntrySelected = { entry ->
-                if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
-                if (entry.isTimelineSlot() && entry.id == entryIds.getOrNull(selectedIndex) && dockRuntime?.onSelectedTimelineClick != null) {
-                    dockRuntime.onSelectedTimelineClick.invoke()
-                } else if (dockRuntime != null && entry.isTimelineShortcut()) {
-                    dockRuntime.onEntrySelected(entry)
-                } else {
-                    onTabChange(entry.toMainTab())
-                }
-            },
+            onEntrySelected = selectEntry,
             onEndcapSelected = { tab ->
                 onTimelineMenuExpandedChange(false)
                 onTabChange(tab)
             },
-            onTimelineDoubleClick = dockRuntime?.onEntryDoubleClick?.let { refresh ->
+            hasSelectedTimelineClick = dockRuntime?.onSelectedTimelineClick != null,
+            onTimelineDoubleClick = dockRuntime?.onEntryDoubleClick?.let { goToTopAndRefresh ->
                 { entry ->
-                    // Consume both taps on timeline slots, but a reselect-enabled dock only
-                    // refreshes its active route, including when represented by the Home alias.
-                    if (dockRuntime?.onSelectedTimelineClick == null || entry.id == entryIds.getOrNull(selectedIndex)) {
+                    if (entry.id == selectedEntryId) {
                         if (timelineMenuExpanded) onTimelineMenuExpandedChange(false)
-                        refresh(entry)
+                        goToTopAndRefresh(entry)
+                    } else {
+                        // A double tap on an inactive timeline only switches there once.
+                        selectEntry(entry)
                     }
                 }
             },
-            hasTimelineReselect = dockRuntime?.onSelectedTimelineClick != null,
             onTimelineLongPress = { entry ->
                 menuAnchorEntryId = entry.id
                 onTimelineMenuExpandedChange(true)
@@ -263,8 +268,8 @@ private fun ViboDock(
     homeLabel: String,
     onEntrySelected: (ViboDockEntry) -> Unit,
     onEndcapSelected: (MainTab) -> Unit,
+    hasSelectedTimelineClick: Boolean,
     onTimelineDoubleClick: ((ViboDockEntry) -> Unit)?,
-    hasTimelineReselect: Boolean,
     onTimelineLongPress: (ViboDockEntry) -> Unit,
     showLabels: Boolean,
     unreadMessagesCount: Int,
@@ -336,10 +341,12 @@ private fun ViboDock(
                                     ?.let { callback -> { callback(entry) } },
                                 modifier = Modifier.semantics {
                                     contentDescription = entry.title
-                                    if (hasTimelineReselect && index == selectedIndex && entry.isTimelineSlot()) {
-                                        onClick(label = "回到已读位置") { onEntrySelected(entry); true }
-                                        onTimelineDoubleClick?.let { refresh ->
-                                            customActions = listOf(CustomAccessibilityAction("刷新时间线") { refresh(entry); true })
+                                    if (index == selectedIndex && entry.isTimelineSlot()) {
+                                        if (hasSelectedTimelineClick) {
+                                            onClick(label = "回到顶部") { onEntrySelected(entry); true }
+                                        }
+                                        onTimelineDoubleClick?.let { goToTopAndRefresh ->
+                                            customActions = listOf(CustomAccessibilityAction("回到顶部并刷新") { goToTopAndRefresh(entry); true })
                                         }
                                     }
                                     if (isHome && homeLabel != entry.title) stateDescription = homeLabel

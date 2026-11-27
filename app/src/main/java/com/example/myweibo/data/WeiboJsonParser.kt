@@ -32,8 +32,8 @@ object WeiboJsonParser {
         ?: root.optJSONArray("list")
 
     /** The display parser is deliberately tolerant. Losing even one ordinary row or
-     * seeing an error/partial envelope is not proof that the user has caught up. */
-    internal fun hasCompleteTimelineReadingResponse(raw: String, page: TimelinePage): Boolean {
+     * seeing an error/partial envelope cannot confirm a new-post batch. */
+    internal fun hasCompleteExplicitTimelineResponse(raw: String, page: TimelinePage): Boolean {
         val root = try { JSONObject(raw) } catch (_: org.json.JSONException) { return false }
         val data = root.optJSONObject("data")
         if (root.has("data") && !root.isNull("data") && data == null) return false

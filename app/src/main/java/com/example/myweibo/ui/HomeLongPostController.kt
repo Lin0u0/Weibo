@@ -82,7 +82,6 @@ internal class HomeLongPostReadingSession {
 /** Timeline-owned so an expanded body stays expanded when recycled by LazyColumn. */
 internal class HomeLongPostController(
     private val listState: LazyListState,
-    private val onBeforeCollapse: () -> Unit = {},
 ) {
     private data class FoldedAnchor(
         val rowOffset: Int,
@@ -241,7 +240,6 @@ internal class HomeLongPostController(
         val offset = (ownerTop + ownerOffset).roundToInt()
         activeCollapse = CollapseMotion(key, -row.offset, offset, restoreFocus)
         suppressPagingForLayoutChange()
-        onBeforeCollapse()
     }
 
     suspend fun animateCollapse(motion: CollapseMotion) {

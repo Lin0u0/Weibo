@@ -21,8 +21,10 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeLeft
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -36,8 +38,9 @@ import com.example.myweibo.ui.MainTab
 import com.example.myweibo.ui.ViboDockRuntime
 import com.example.myweibo.ui.WeiboLiquidBottomBar
 import com.kyant.backdrop.backdrops.emptyBackdrop
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -109,7 +112,7 @@ class ViboDockRuntimeComposeTest {
         val shortcut = entry(group).assertIsDisplayed().assertIsSelected()
         home.assert(notSelected)
         shortcut.performClick()
-        compose.runOnIdle { assertEquals(group, clickedEntry) }
+        compose.runOnIdle { assertNull(clickedEntry) }
         mine.performClick().assertIsSelected()
         shortcut.assert(notSelected)
     }
@@ -166,17 +169,20 @@ class ViboDockRuntimeComposeTest {
         compose.runOnIdle { assertEquals(0, selections) }
     }
 
-    @Test fun doubleTouchOnArbitraryTimelineIsExclusiveWhenCapsuleFits() = assertExclusiveTimelineDoubleTouch(380.dp)
+    @Test fun timelineTapActionsAreExclusiveWhenCapsuleFits() = assertTimelineTapActions(380.dp)
 
-    @Test fun doubleTouchOnArbitraryTimelineIsExclusiveWhenCapsuleScrolls() = assertExclusiveTimelineDoubleTouch(280.dp)
+    @Test fun timelineTapActionsAreExclusiveWhenCapsuleScrolls() = assertTimelineTapActions(280.dp)
 
-    private fun assertExclusiveTimelineDoubleTouch(width: Dp) {
+    private fun assertTimelineTapActions(width: Dp) {
         val shortcut = ViboDockEntry.forTimeline(TimelineKind.Favorites)
+        val unpinned = ViboDockEntry.forTimeline(TimelineKind.FriendsCircle)
         val order = listOf(ViboDockEntry.Home.id, shortcut.id, ViboDockEntry.Messages.id, ViboDockEntry.Compose.id)
-        val singles = mutableListOf<ViboDockEntry>()
-        val doubles = mutableListOf<ViboDockEntry>()
+        val selections = mutableListOf<ViboDockEntry>()
+        val topAndRefreshes = mutableListOf<ViboDockEntry>()
+        val topOnlyCount = AtomicInteger()
         val mainTabClicks = mutableListOf<MainTab>()
-        val singleReceived = AtomicBoolean(false)
+        val selectionCount = AtomicInteger()
+        var selectedEntryId by mutableStateOf(unpinned.id)
         var menuExpanded by mutableStateOf(false)
         compose.setContent {
             MaterialTheme {
@@ -193,47 +199,90 @@ class ViboDockRuntimeComposeTest {
                         glassAmount = 0f,
                         applyNavigationBarInsets = false,
                         dockRuntime = ViboDockRuntime(
-                            catalogue = listOf(shortcut),
+                            catalogue = listOf(shortcut, unpinned),
+                            selectedEntryId = selectedEntryId,
                             onEntrySelected = {
-                                singles.add(it)
-                                singleReceived.set(true)
+                                selections.add(it)
+                                selectedEntryId = it.id
+                                selectionCount.incrementAndGet()
                             },
                             profileAvatar = null,
-                            onEntryDoubleClick = { doubles.add(it) },
+                            onSelectedTimelineClick = { topOnlyCount.incrementAndGet() },
+                            onEntryDoubleClick = { topAndRefreshes.add(it) },
                         ),
                     )
                 }
             }
         }
 
-        val tab = entry(shortcut).assertIsDisplayed()
-        tab.performTouchInput { doubleClick() }
+        val tab = entry(shortcut).assertIsDisplayed().assert(notSelected)
+        val home = entry(ViboDockEntry.Home).assertIsSelected()
+        tab.assert(SemanticsMatcher.keyNotDefined(SemanticsActions.CustomActions))
+
+        // Home stands in for the active unpinned route.
+        home.performTouchInput { doubleClick() }
         compose.runOnIdle {
-            assertEquals(listOf(shortcut), doubles)
-            assertTrue(singles.isEmpty())
-            assertTrue(!menuExpanded)
+            assertEquals(listOf(ViboDockEntry.Home), topAndRefreshes)
+            assertTrue(selections.isEmpty())
+            assertEquals(0, topOnlyCount.get())
         }
-        entry(ViboDockEntry.Home).assertIsSelected().performTouchInput { doubleClick() }
-        val doubleEvents = listOf(shortcut, ViboDockEntry.Home)
+
+        // An inactive timeline double tap only selects it once, even with a real selection update.
+        tab.performTouchInput { doubleClick() }
+        tab.assertIsSelected()
+        home.assert(SemanticsMatcher.keyNotDefined(SemanticsActions.CustomActions))
         compose.runOnIdle {
-            assertEquals(doubleEvents, doubles)
-            assertTrue(mainTabClicks.isEmpty())
+            assertEquals(listOf(shortcut), selections)
+            assertEquals(listOf(ViboDockEntry.Home), topAndRefreshes)
+        }
+
+        tab.performTouchInput { doubleClick() }
+        val touchRefreshes = listOf(ViboDockEntry.Home, shortcut)
+        compose.runOnIdle {
+            assertEquals(touchRefreshes, topAndRefreshes)
             assertTrue(!menuExpanded)
+            assertEquals(0, topOnlyCount.get())
         }
         tab.performTouchInput { longClick() }
         compose.onNodeWithText("Timeline picker").assertIsDisplayed()
         compose.runOnIdle {
-            assertTrue(singles.isEmpty())
-            assertEquals(doubleEvents, doubles)
+            assertEquals(touchRefreshes, topAndRefreshes)
+            assertEquals(0, topOnlyCount.get())
             menuExpanded = false
         }
-        // Finish the long-press menu's exit before injecting the independent tap.
         compose.onNodeWithText("Timeline picker").assertDoesNotExist()
         tab.performTouchInput { click() }
-        compose.waitUntil(timeoutMillis = 2_000) { singleReceived.get() }
+        compose.waitUntil(timeoutMillis = 2_000) { topOnlyCount.get() >= 1 }
         compose.runOnIdle {
-            assertEquals(listOf(shortcut), singles)
-            assertEquals(doubleEvents, doubles)
+            assertEquals(1, topOnlyCount.get())
+            assertEquals(touchRefreshes, topAndRefreshes)
+            assertEquals(listOf(shortcut), selections)
+            assertTrue(mainTabClicks.isEmpty())
+        }
+
+        val semantics = tab.fetchSemanticsNode().config
+        assertEquals("回到顶部", semantics[SemanticsActions.OnClick].label)
+        val goToTopAndRefresh = semantics[SemanticsActions.CustomActions].single()
+        assertEquals("回到顶部并刷新", goToTopAndRefresh.label)
+        tab.performSemanticsAction(SemanticsActions.OnClick) { click -> assertTrue(click()) }
+        compose.runOnIdle {
+            assertEquals(2, topOnlyCount.get())
+            assertEquals(touchRefreshes, topAndRefreshes)
+            assertEquals(listOf(shortcut), selections)
+            assertTrue(mainTabClicks.isEmpty())
+            assertTrue(goToTopAndRefresh.action())
+            assertEquals(2, topOnlyCount.get())
+            assertEquals(touchRefreshes + shortcut, topAndRefreshes)
+            selectedEntryId = unpinned.id
+        }
+
+        // An ordinary tap on a different timeline still switches there.
+        tab.assert(notSelected).performTouchInput { click() }
+        compose.waitUntil(timeoutMillis = 2_000) { selectionCount.get() >= 2 }
+        tab.assertIsSelected()
+        compose.runOnIdle {
+            assertEquals(listOf(shortcut, shortcut), selections)
+            assertEquals(touchRefreshes + shortcut, topAndRefreshes)
             assertTrue(mainTabClicks.isEmpty())
         }
     }

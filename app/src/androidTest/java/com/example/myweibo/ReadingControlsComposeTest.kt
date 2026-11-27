@@ -617,10 +617,7 @@ class ReadingControlsComposeTest {
         }
         assertAbove(0)
         compose.runOnIdle {
-            timeline.seedFixtureReadingAnchor(r)
-            timeline.publishRefresh(
-                TimelinePage(listOf(n3, n2, n1, r)), state, protectViewport = true, keepReading = true,
-            )
+            timeline.publishFixtureNewBatch(listOf(n3, n2, n1, r), state, newCount = 3)
         }
         compose.runOnIdle {
             assertEquals(2, timeline.feedProjection.gap?.hiddenPostCount)
@@ -645,17 +642,18 @@ class ReadingControlsComposeTest {
             val rIndex = rows.indexOfFirst { it.key == r.id }
             assertEquals(rOffset, rows.getOrNull(rIndex)?.offset)
             assertEquals(n1.id, rows.getOrNull(rIndex - 1)?.key)
-            state.requestScrollToItem(2, topClearance) // Expanded N2 is still visible.
+            assertNull(timeline.feedProjection.dividerIndex)
+            state.requestScrollToItem(1, topClearance) // N2; no divider remains.
         }
         assertAbove(1)
-        compose.runOnIdle { state.requestScrollToItem(4, topClearance) } // Expanded R.
+        compose.runOnIdle { state.requestScrollToItem(3, topClearance) } // Expanded R.
         assertAbove(3)
         compose.runOnIdle { timeline.items = timeline.items + fixturePost(0) }
         assertAbove(3)
     }
 
     @Test
-    fun closingAndReopeningReverseReadingGapKeepsExpansionInItsHiddenRows() {
+    fun revealingReverseReadingGapKeepsLongPostExpansionWhenScrollingAwayAndBack() {
         val previous = (10 downTo 1).map(::fixturePost)
         val hidden = fixturePost(11).copy(text = NavigationBody)
         val newest = fixturePost(12)
@@ -671,14 +669,13 @@ class ReadingControlsComposeTest {
         }
         val body = cardText(NavigationBody, substring = false)
         compose.runOnIdle {
-            timeline.seedFixtureReadingAnchor(previous.first())
-            timeline.publishRefresh(TimelinePage(listOf(newest, hidden)), listState, protectViewport = true, keepReading = true)
+            timeline.publishFixtureNewBatch(listOf(newest, hidden, previous.first()), listState, newCount = 2)
         }
         body.assertIsNotDisplayed()
         compose.runOnIdle {
             assertEquals(1, timeline.feedProjection.gap?.hiddenPostCount)
             assertTrue(timeline.feedProjection.visibleItems.none { it.id == hidden.id })
-            timeline.toggleTimelineGap(listState)
+            timeline.expandTimelineGap(listState)
         }
         compose.runOnIdle {
             val projection = timeline.feedProjection
@@ -686,15 +683,14 @@ class ReadingControlsComposeTest {
         }
         cardToggle(quoted = false).performClick()
         body.assertLayout(5, false, TextOverflow.Clip)
-        compose.runOnIdle { timeline.toggleTimelineGap(listState) }
-        body.assertIsNotDisplayed()
         compose.runOnIdle {
-            assertTrue(timeline.feedProjection.visibleItems.none { it.id == hidden.id })
-            assertTrue(timeline.items.any { it.id == hidden.id })
+            timeline.expandTimelineGap(listState) // A second reveal request must not re-collapse the batch.
+            assertNull(timeline.feedProjection.dividerIndex)
+            assertTrue(timeline.feedProjection.visibleItems.any { it.id == hidden.id })
             assertTrue(timeline.longPostController(listState).isExpanded(HomeLongPostKey(hidden.id)))
-            listState.requestScrollToItem(0)
+            listState.requestScrollToItem(8)
         }
-        compose.runOnIdle { timeline.toggleTimelineGap(listState) }
+        body.assertIsNotDisplayed()
         compose.runOnIdle {
             val projection = timeline.feedProjection
             listState.requestScrollToItem(projection.lazyIndexOfPost(projection.visibleItems.indexOfFirst { it.id == hidden.id }))
@@ -1147,7 +1143,7 @@ class ReadingControlsComposeTest {
                 assertEquals(expectedKeepReading, keepReading)
                 timeline.publishRefresh(TimelinePage(listOf(refreshed), nextCursor = "new-page"), listState, protectViewport, keepReading)
                 assertEquals(if (keepReading) posts.map { it.id } else listOf(post.id), timeline.items.map { it.id })
-                assertNull(timeline.readingBoundaryLazyIndex) // Refresh alone never establishes read progress.
+                assertNull(timeline.confirmedRefresh) // Automatic refresh does not create a fold batch.
                 assertEquals("new-page".takeUnless { keepReading }, timeline.nextCursor)
             }
             compose.mainClock.advanceTimeByFrame()
@@ -1286,12 +1282,19 @@ class ReadingControlsComposeTest {
         }
     }
 
-    private fun HomeTimelineReadingState.seedFixtureReadingAnchor(row: FeedItem) {
+    private fun HomeTimelineReadingState.publishFixtureNewBatch(
+        response: List<FeedItem>,
+        listState: LazyListState,
+        newCount: Int,
+    ) {
         val account = "123"
         timelineCacheAccountId = account
-        acceptReadingRows(account, chronological = true)
-        markReadingRowsViewed(requireNotNull(readingScope), setOf(row.id))
-        assertEquals(row.id, readingAnchor?.rowId)
+        acceptOrderedRows(account, chronological = true)
+        timelineRequestGeneration++
+        val baseline = requireNotNull(captureExplicitRefreshBaseline(account))
+        assertEquals(newCount, publishRefresh(
+            TimelinePage(response), listState, protectViewport = true, keepReading = true, explicitBaseline = baseline,
+        ))
     }
 
     @Composable

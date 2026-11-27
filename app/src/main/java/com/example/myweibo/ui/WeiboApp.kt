@@ -430,12 +430,10 @@ import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.FeedTimelineRefreshProjection
 import com.example.myweibo.data.TimelinePage
-import com.example.myweibo.data.TimelineReadingAnchor
-import com.example.myweibo.data.TimelineReadingBoundaryStore
-import com.example.myweibo.data.TimelineRefreshReadingBatch
+import com.example.myweibo.data.TimelineRefreshPostIdentity
+import com.example.myweibo.data.ConfirmedTimelineRefresh
 import com.example.myweibo.data.classifyExplicitTimelineRefresh
-import com.example.myweibo.data.TimelineReadingScope
-import com.example.myweibo.data.advanceTimelineReadingAnchor
+import com.example.myweibo.data.TimelineRefreshRoute
 import com.example.myweibo.data.hasChronologicalResponse
 import com.example.myweibo.data.countNewTimelinePosts
 import com.example.myweibo.data.mergeFeedTimelinePages
@@ -473,7 +471,6 @@ import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.gestures.stopScroll
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
@@ -4266,12 +4263,12 @@ private fun accountMatchingTimelineCookie(account: StoredWeiboAccount?): String?
 
 /** Immutable first-page comparison, tied to the authenticated route and request that captured it. */
 internal class ExplicitTimelineRefreshBaseline(
-    val scope: TimelineReadingScope,
+    val scope: TimelineRefreshRoute,
     val requestGeneration: Int,
     val cacheSessionGeneration: Int,
     val visitGeneration: Int,
     val items: List<FeedItem>,
-    val requiredSeams: List<Pair<TimelineReadingAnchor, TimelineReadingAnchor>>,
+    val requiredSeams: List<Pair<TimelineRefreshPostIdentity, TimelineRefreshPostIdentity>>,
 )
 
 // Keep home timeline snapshots behind one capture in WeiboApp's navigation lambdas.
@@ -4281,7 +4278,6 @@ internal class HomeTimelineReadingState(
     val cacheStore: TimelineCacheStore,
     initialKind: TimelineKind,
     initialPreferences: ReadingPreferences = preferencesStore.read(),
-    private val boundaryStore: TimelineReadingBoundaryStore? = null,
 ) {
     var preferences by mutableStateOf(initialPreferences)
         private set
@@ -4293,10 +4289,7 @@ internal class HomeTimelineReadingState(
     var timelineGroupsOwnerId by mutableStateOf<String?>(null)
     var selectedTimelineGroupId by mutableStateOf<String?>(null)
     var items by mutableStateOf<List<FeedItem>>(emptyList())
-    private var protectReadingProjection by mutableStateOf(false)
-    private var forceDockProjection by mutableStateOf(false)
     private var protectedNewPostFloor by mutableIntStateOf(0)
-    private var suppressHistoricalNewPostsMarker by mutableStateOf(false)
     var reverseBrowseGapExpanded by mutableStateOf(false)
         private set
     private var pendingGapExpansionAnchor: Pair<String, Int>? = null
@@ -4318,51 +4311,37 @@ internal class HomeTimelineReadingState(
     var timelineCacheSessionGeneration by mutableIntStateOf(0)
     var timelineCacheAccountId by mutableStateOf<String?>(null)
 
-    private val readingRoute by derivedStateOf {
-        TimelineReadingScope.of(timelineCacheAccountId, timelineKind, selectedTimelineGroupId)
+    private val refreshRoute by derivedStateOf {
+        TimelineRefreshRoute.of(timelineCacheAccountId, timelineKind, selectedTimelineGroupId)
     }
-    private var readingRowsOwner by mutableStateOf<TimelineReadingScope?>(null)
-    val readingScope: TimelineReadingScope? get() = readingRowsOwner?.takeIf { it == readingRoute }
-    private var persistedBoundary by mutableStateOf<Pair<TimelineReadingScope, TimelineReadingAnchor?>?>(null)
-    private var persistedRefreshBatch by mutableStateOf<Pair<TimelineReadingScope, TimelineRefreshReadingBatch?>?>(null)
-    private var disconnectedAt = emptySet<TimelineReadingAnchor>()
-    private var explicitRefreshVisitGeneration = 0
-    private var resumeReadingJob: Job? = null
-    private var readingResumeGeneration = 0
-    internal var resumeInProgress by mutableStateOf(false)
+    private var displayedRowsOwner by mutableStateOf<TimelineRefreshRoute?>(null)
+    val displayedOrderedRoute: TimelineRefreshRoute? get() = displayedRowsOwner?.takeIf { it == refreshRoute }
+    private var confirmedProjection by mutableStateOf<Pair<TimelineRefreshRoute, ConfirmedTimelineRefresh>?>(null)
+    private var disconnectedAt = emptySet<TimelineRefreshPostIdentity>()
+    var explicitRefreshVisitGeneration = 0
         private set
-    internal val readingAnchor: TimelineReadingAnchor?
-        get() = persistedBoundary?.takeIf { it.first == readingScope }?.second
 
-    internal val refreshReadingBatch: TimelineRefreshReadingBatch?
-        get() = persistedRefreshBatch?.takeIf { it.first == readingScope }?.second
-
-    internal val hasRefreshReadingDisposition: Boolean get() = refreshReadingBatch != null
+    // This describes only the current list's fold, not which posts the user has read.
+    internal val confirmedRefresh: ConfirmedTimelineRefresh?
+        get() = confirmedProjection?.takeIf { it.first == displayedOrderedRoute }?.second
+    internal val hasConfirmedRefresh: Boolean get() = confirmedRefresh != null
 
     /** Called only after displaying an account-owned cache or an accepted network page. */
-    fun acceptReadingRows(verifiedAccountId: String?, chronological: Boolean) {
-        val route = readingRoute?.takeIf { it.accountId == verifiedAccountId && chronological }
-        readingRowsOwner = route
-        if (route != null && persistedBoundary?.first != route) {
-            persistedBoundary = route to boundaryStore?.read(route)
-            persistedRefreshBatch = route to boundaryStore?.readRefreshBatch(route)
-            // A newly mounted visit has not scrolled through the restored batch yet.
-            if (hasRefreshReadingDisposition) pauseReadingExposure()
-        }
+    fun acceptOrderedRows(verifiedAccountId: String?, chronological: Boolean) {
+        displayedRowsOwner = refreshRoute?.takeIf { it.accountId == verifiedAccountId && chronological }
     }
 
     fun captureExplicitRefreshBaseline(verifiedAccountId: String?): ExplicitTimelineRefreshBaseline? {
-        val route = readingScope?.takeIf { it.accountId == verifiedAccountId } ?: return null
+        val route = displayedOrderedRoute?.takeIf { it.accountId == verifiedAccountId } ?: return null
         if (!timelineKind.hasOrderedRefresh(selectedTimelineGroupId, items)) return null
         val ordinary = items.filterNot { it.isPinned }
         if (ordinary.isEmpty()) return null
-        val batch = refreshReadingBatch
-        val priorBoundary = if (batch == null) readingAnchor else batch.remaining.lastOrNull() ?: batch.baseline
-        val stopIndex = priorBoundary?.let { ordinary.indexOfFirst(it::matches) }
+        val priorHead = confirmedRefresh?.baseline
+        val stopIndex = priorHead?.let { ordinary.indexOfFirst(it::matches) }
             ?.takeIf { it >= 0 } ?: ordinary.lastIndex
         val seams = if (disconnectedAt.isEmpty()) emptyList() else ordinary.take(stopIndex + 1).zipWithNext().mapNotNull { (newer, older) ->
             val seam = disconnectedAt.firstOrNull { it.matches(older) } ?: return@mapNotNull null
-            TimelineReadingAnchor.from(newer)?.let { it to seam }
+            TimelineRefreshPostIdentity.from(newer)?.let { it to seam }
         }
         return ExplicitTimelineRefreshBaseline(
             route, timelineRequestGeneration, timelineCacheSessionGeneration, explicitRefreshVisitGeneration, items, seams,
@@ -4371,83 +4350,21 @@ internal class HomeTimelineReadingState(
 
     fun leaveExplicitRefreshVisit() {
         explicitRefreshVisitGeneration++
-        if (hasRefreshReadingDisposition) pauseReadingExposure()
     }
 
-    // Layout, expansion, and resume scrolling cannot qualify a row. Only a subsequent
-    // user scroll, then the usual settled visibility dwell, makes reading eligible.
-    private var readingWaitsForUserScroll by mutableStateOf(false)
-    internal var readingExposureGeneration by mutableIntStateOf(0)
-        private set
-    fun pauseReadingExposure(waitForUserScroll: Boolean = true) {
-        readingWaitsForUserScroll = waitForUserScroll
-        readingExposureGeneration++
-    }
-
-    fun onReadingUserScroll() {
-        if (!isLoading && !resumeInProgress) readingWaitsForUserScroll = false
-    }
-
-    fun canObserveReadingRow(rowId: String): Boolean {
-        if (readingWaitsForUserScroll) return false
-        val batch = refreshReadingBatch ?: return true
-        val item = items.firstOrNull { it.id == rowId } ?: return false
-        return batch.remaining.any { it.matches(item) }
-    }
-
-    fun markReadingRowsViewed(scope: TimelineReadingScope, rowIds: Set<String>) {
-        if (scope != readingScope || isLoading || readingWaitsForUserScroll) return
-        val batch = refreshReadingBatch
-        if (batch != null) {
-            if (resumeInProgress) return
-            val updated = batch.afterViewing(items, rowIds)
-            if (updated != batch) {
-                boundaryStore?.writeRefreshBatch(scope, updated)
-                persistedRefreshBatch = scope to updated
-            }
-            return
-        }
-        val previous = readingAnchor
-        val updated = advanceTimelineReadingAnchor(previous, items, rowIds, disconnectedAt)
-        if (updated != null && updated != previous) {
-            boundaryStore?.write(scope, updated)
-            persistedBoundary = scope to updated
-        }
-    }
-
-    private val resumeRow by derivedStateOf {
-        val batch = refreshReadingBatch
-        val target = if (batch == null) readingAnchor else batch.remaining.lastOrNull()
-        target?.let { anchor -> items.firstOrNull(anchor::matches) }
-    }
-
-    private fun projectReadingRows(rows: List<FeedItem>, limit: Int): FeedTimelineRefreshProjection {
-        val batch = refreshReadingBatch
-        val showProjection = (protectReadingProjection || batch != null) &&
-            (preferences.reverseReading || forceDockProjection || batch?.forceProjection == true)
-        val boundary = if (!showProjection) null else if (batch == null) readingAnchor else batch.baseline
-        val boundaryId = boundary?.let { key -> rows.firstOrNull(key::matches)?.id }
-        val unreadIds = batch?.let {
-            val rowIds = it.remaining.mapTo(HashSet()) { key -> key.rowId }
-            val statusIds = it.remaining.mapNotNullTo(HashSet()) { key -> key.statusId }
-            rows.asSequence().filter { post -> post.id in rowIds || post.statusId in statusIds }
-                .map { post -> post.id }.toHashSet()
-        }
-        val projection = projectFeedTimelineRefresh(rows, boundaryId, limit, reverseBrowseGapExpanded, unreadIds)
-        return if (batch == null && suppressHistoricalNewPostsMarker && projection.newPostsMarkerIndex != null) {
-            projection.copy(newPostsMarkerIndex = null)
-        } else projection
+    private fun projectRefreshRows(rows: List<FeedItem>, limit: Int): FeedTimelineRefreshProjection {
+        val batch = confirmedRefresh ?: return FeedTimelineRefreshProjection(rows, gap = null)
+        if (!preferences.reverseReading) return FeedTimelineRefreshProjection(rows, gap = null)
+        val boundaryId = batch.baseline.resolve(rows)?.id
+        val rowIds = batch.newPosts.mapTo(HashSet()) { it.rowId }
+        val statusIds = batch.newPosts.mapNotNullTo(HashSet()) { it.statusId }
+        val newPostIds = rows.asSequence().filter { it.id in rowIds || it.statusId in statusIds }
+            .map { it.id }.toHashSet()
+        return projectFeedTimelineRefresh(rows, boundaryId, limit, reverseBrowseGapExpanded, newPostIds)
     }
 
     val feedProjection by derivedStateOf {
-        projectReadingRows(items, maxOf(preferences.newPostLimit, protectedNewPostFloor))
-    }
-
-    /** Exact keyed resume row in the rendered projection, including any divider. */
-    val readingBoundaryLazyIndex by derivedStateOf {
-        val key = resumeRow?.id ?: return@derivedStateOf null
-        val projection = feedProjection
-        projection.visibleItems.indexOfFirst { it.id == key }.takeIf { it >= 0 }?.let(projection::lazyIndexOfPost)
+        projectRefreshRows(items, maxOf(preferences.newPostLimit, protectedNewPostFloor))
     }
 
     fun updatePreferences(update: (ReadingPreferences) -> ReadingPreferences) {
@@ -4457,83 +4374,28 @@ internal class HomeTimelineReadingState(
                 resetLongPostReading()
             }
             if (preferences.newPostLimit != updated.newPostLimit) protectedNewPostFloor = 0
-            if (preferences.reverseReading && !updated.reverseReading && !forceDockProjection) resetGap()
+            if (preferences.reverseReading && !updated.reverseReading) protectedNewPostFloor = 0
             preferences = updated
         }
     }
 
     val hasProtectedReadingProjection: Boolean
-        get() = protectReadingProjection && (preferences.reverseReading || forceDockProjection)
+        get() = hasConfirmedRefresh && preferences.reverseReading
 
     private fun resetGap() {
-        protectReadingProjection = false
-        forceDockProjection = false
         protectedNewPostFloor = 0
-        suppressHistoricalNewPostsMarker = false
         reverseBrowseGapExpanded = false
         pendingGapExpansionAnchor = null
     }
 
-    fun onHomeTabReselected(listState: LazyListState, coroutineScope: CoroutineScope) {
-        if (isLoading) return
-        val key = resumeRow?.id ?: return
-        val route = readingScope ?: return
-        if (hasRefreshReadingDisposition) pauseReadingExposure()
-        val collapsedCount = listState.layoutInfo.totalItemsCount
-        val reveal = readingBoundaryLazyIndex == null && feedProjection.gap != null && !reverseBrowseGapExpanded
-        if (reveal) {
-            // A selected resume reveals the exact member. Do not run the separate divider
-            // click's old-head anchoring; the keyed jump below owns this transition.
-            pendingGapExpansionAnchor = null
-            reverseBrowseGapExpanded = true
-        }
-        val target = readingBoundaryLazyIndex ?: return
-        cancelReadingResume()
-        val generation = readingResumeGeneration
-        resumeInProgress = true
-        resumeReadingJob = coroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
-            fun isCurrent() = generation == readingResumeGeneration && readingScope == route &&
-                readingBoundaryLazyIndex == target && resumeRow?.id == key
-            try {
-                // The expanded projection state updates immediately, but the lazy list still
-                // has its old item provider until the next layout.
-                if (reveal && withTimeoutOrNull(1_000L) {
-                    snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it != collapsedCount }
-                } == null) return@launch
-                listState.resumeReadingAt(target, key, ::isCurrent)
-            } finally {
-                // Keep pagination asleep until the next genuine list scroll.
-                if (generation == readingResumeGeneration) {
-                    if (hasRefreshReadingDisposition) longPostController(listState).suppressPagingForLayoutChange()
-                    resumeInProgress = false
-                }
-            }
-        }
-    }
-
-    fun cancelReadingResume() {
-        readingResumeGeneration++
-        resumeReadingJob?.cancel()
-        resumeReadingJob = null
-        resumeInProgress = false
-    }
-
-    fun toggleTimelineGap(listState: LazyListState) {
+    fun expandTimelineGap(listState: LazyListState, preserveViewport: Boolean = true) {
         val projection = feedProjection
         val gap = projection.gap ?: return
-        if (hasRefreshReadingDisposition) pauseReadingExposure()
-        if (reverseBrowseGapExpanded) {
-            pendingGapExpansionAnchor = null
-            protectedNewPostFloor = 0
-            reverseBrowseGapExpanded = false
-            listState.retainHomeViewportIfKeyRemoved(feedProjection)
-            return
-        }
         // Unfold above the old head, even when a newer post is still visible above the divider.
-        // Anchoring that newer post (or the divider) would push the old head down instead.
+        // Anchoring that newer post or the disappearing divider would push the old head down.
         val oldHead = projection.previousHeadIndex?.let(projection.visibleItems::getOrNull)
         val visibleRows = listState.layoutInfo.visibleItemsInfo
-        pendingGapExpansionAnchor = oldHead?.let { post ->
+        pendingGapExpansionAnchor = oldHead?.takeIf { preserveViewport }?.let { post ->
             val offset = visibleRows.firstOrNull { it.key == post.id }?.offset
                 // The divider can be tapped even if the next row hasn't entered the viewport.
                 ?: visibleRows.firstOrNull { it.index == gap.insertionIndex && it.key == FeedReverseBrowseGapKey }
@@ -4568,13 +4430,10 @@ internal class HomeTimelineReadingState(
     } else null
 
     fun forgetTimelineCacheAccount() {
-        cancelReadingResume()
         timelineCacheSessionGeneration += 1
         timelineCacheAccountId = null
-        readingRowsOwner = null
-        persistedBoundary = null
-        persistedRefreshBatch = null
-        pauseReadingExposure(waitForUserScroll = false)
+        displayedRowsOwner = null
+        confirmedProjection = null
         disconnectedAt = emptySet()
         followingDiskIds = emptySet()
     }
@@ -4584,59 +4443,66 @@ internal class HomeTimelineReadingState(
         listState: LazyListState,
         protectViewport: Boolean,
         keepReading: Boolean,
-        dockRefresh: Boolean = false,
-        successfulNoNewAtTop: Boolean = false,
         reusePreviousRows: Boolean = true,
         explicitBaseline: ExplicitTimelineRefreshBaseline? = null,
         explicitResponseVerified: Boolean = true,
+        returnToTop: Boolean = false,
     ): Int? {
         val ordered = selectedTimelineGroupId != null || timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle
         val incoming = if (ordered) sortFeedTimelineItems(page.items) else page.items
         if (keepReading) {
             if (incoming.isEmpty()) return null
             val merged = mergeFeedTimelineRefresh(items, incoming)
-            // A permissively displayed explicit response may add rows, but cannot
-            // establish or heal a continuity seam without complete raw evidence.
-            reconcileReadingContinuity(if (explicitBaseline != null && !explicitResponseVerified) emptyList() else page.items, merged)
-            protectReadingProjection = true
-            if (!hasRefreshReadingDisposition && explicitBaseline == null) forceDockProjection = forceDockProjection || dockRefresh
-            suppressHistoricalNewPostsMarker = successfulNoNewAtTop
+            // Only a proven explicit response can replace the fold batch. Automatic refreshes
+            // and unconfirmed responses may update the feed, but never change batch membership.
             val refreshedBatch = explicitBaseline?.takeIf {
-                explicitResponseVerified && it.scope == readingScope && it.requestGeneration == timelineRequestGeneration &&
+                explicitResponseVerified && it.scope == displayedOrderedRoute && it.requestGeneration == timelineRequestGeneration &&
                     it.cacheSessionGeneration == timelineCacheSessionGeneration && it.visitGeneration == explicitRefreshVisitGeneration &&
                     timelineKind.hasOrderedRefresh(selectedTimelineGroupId, page.items)
             }?.let { baseline ->
                 classifyExplicitTimelineRefresh(baseline.items, page.items, baseline.requiredSeams)?.takeIf { batch ->
                     // Sort/merge rules must place the same members before the proven head.
-                    val headIndex = merged.indexOfFirst(batch.baseline::matches)
-                    headIndex >= 0 && batch.remaining.all { anchor ->
-                        merged.indexOfFirst(anchor::matches) in 0 until headIndex
+                    val head = batch.baseline.resolve(merged) ?: return@takeIf false
+                    val headIndex = merged.indexOfFirst { it === head }
+                    var previousIndex = -1
+                    batch.newPosts.all { anchor ->
+                        val row = anchor.resolve(merged)
+                        val index = merged.indexOfFirst { it === row }
+                        (index > previousIndex && index < headIndex).also { previousIndex = index }
                     }
-                }?.copy(forceProjection = dockRefresh || forceDockProjection || refreshReadingBatch?.forceProjection == true)?.also { batch ->
+                }?.also { batch ->
                     longPostController(listState).suppressPagingForLayoutChange()
-                    boundaryStore?.writeRefreshBatch(baseline.scope, batch)
-                    persistedRefreshBatch = baseline.scope to batch
+                    confirmedProjection = baseline.scope to batch
                     reverseBrowseGapExpanded = false
                     pendingGapExpansionAnchor = null
                 }
             }
-            if (hasRefreshReadingDisposition) pauseReadingExposure()
-            val newProjection = projectRefreshPreservingKey(listState, merged)
-            // Coordinate with the live, keyed viewport, not the position before the request.
-            listState.retainHomeViewportIfKeyRemoved(newProjection)
+            // A permissively displayed explicit response cannot supply continuity evidence;
+            // automatic results cannot silently heal a known disjoint seam either.
+            val continuityRows = if (explicitBaseline != null && !explicitResponseVerified) emptyList() else page.items
+            reconcileRefreshContinuity(continuityRows, merged, mayHeal = refreshedBatch != null)
+            if (returnToTop && refreshedBatch != null) {
+                protectedNewPostFloor = 0
+            } else if (!returnToTop) {
+                // Coordinate with the live keyed viewport, not the request-time position.
+                listState.retainHomeViewportIfKeyRemoved(projectRefreshPreservingKey(listState, merged))
+            }
             items = merged
             timelineVerifiedFromNetwork = true
+            if (returnToTop) goToTimelineTop(listState)
             // The first-page cursor does not belong to the retained tail.
-            return refreshedBatch?.remaining?.size
+            return refreshedBatch?.newPosts?.size
         }
         resetGap()
+        confirmedProjection = null
         disconnectedAt = emptySet()
         val refreshed = replaceFeedTimelineRefresh(if (reusePreviousRows) items else emptyList(), incoming)
-        if (protectViewport) {
+        if (protectViewport && !returnToTop) {
             listState.retainHomeViewportIfKeyRemoved(FeedTimelineRefreshProjection(refreshed, gap = null))
         }
         items = refreshed
         timelineVerifiedFromNetwork = refreshed.isNotEmpty()
+        if (returnToTop) goToTimelineTop(listState)
         nextCursor = page.nextCursor ?: when (timelineKind) {
             TimelineKind.SpecialFollowing, TimelineKind.FriendsCircle -> page.items.lastOrNull()?.id
             else -> null
@@ -4650,7 +4516,7 @@ internal class HomeTimelineReadingState(
     ): FeedTimelineRefreshProjection {
         val limit = preferences.newPostLimit
         protectedNewPostFloor = 0
-        val projection = projectReadingRows(merged, limit)
+        val projection = projectRefreshRows(merged, limit)
         val firstKey = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == listState.firstVisibleItemIndex }?.key
         if (projection.gap == null || projection.visibleItems.any { it.id == firstKey }) return projection
         val index = merged.indexOfFirst { it.id == firstKey }
@@ -4658,38 +4524,38 @@ internal class HomeTimelineReadingState(
         // Don't fold away the currently matched row on a refresh. Keep the collapsed state
         // and expose only as much of the new prefix as is needed to keep that key mounted.
         protectedNewPostFloor = merged.subList(0, index + 1).count { !it.isPinned }
-        return projectReadingRows(merged, maxOf(limit, protectedNewPostFloor))
+        return projectRefreshRows(merged, maxOf(limit, protectedNewPostFloor))
     }
 
-    private fun reconcileReadingContinuity(incoming: List<FeedItem>, merged: List<FeedItem>) {
-        if (readingScope == null) return
+    private fun reconcileRefreshContinuity(incoming: List<FeedItem>, merged: List<FeedItem>, mayHeal: Boolean) {
+        if (displayedOrderedRoute == null) return
         val previousOrdinary = items.filterNot { it.isPinned }
         val incomingOrdinary = incoming.filterNot { it.isPinned }
         val incomingRows = incomingOrdinary.mapIndexed { index, item -> item.id to index }.toMap()
         val incomingStatuses = incomingOrdinary.mapIndexedNotNull { index, item ->
-            TimelineReadingAnchor.from(item)?.statusId?.let { it to index }
+            TimelineRefreshPostIdentity.from(item)?.statusId?.let { it to index }
         }.toMap()
-        fun incomingIndex(anchor: TimelineReadingAnchor) =
+        fun incomingIndex(anchor: TimelineRefreshPostIdentity) =
             incomingRows[anchor.rowId] ?: anchor.statusId?.let(incomingStatuses::get)
         val ordinary = merged.filterNot { it.isPinned }
-        disconnectedAt = disconnectedAt.filterTo(mutableSetOf()) { seam ->
+        if (mayHeal) disconnectedAt = disconnectedAt.filterTo(mutableSetOf()) { seam ->
             val older = incomingIndex(seam)
             val index = ordinary.indexOfFirst(seam::matches)
-            val newer = ordinary.getOrNull(index - 1)?.let(TimelineReadingAnchor::from)?.let(::incomingIndex)
+            val newer = ordinary.getOrNull(index - 1)?.let(TimelineRefreshPostIdentity::from)?.let(::incomingIndex)
             older == null || newer == null || newer >= older
         }
         if (previousOrdinary.isEmpty()) return
         val previousKeys = previousOrdinary.mapTo(HashSet()) { it.id }
-        val head = TimelineReadingAnchor.from(previousOrdinary.first())
+        val head = TimelineRefreshPostIdentity.from(previousOrdinary.first())
         val headIndex = head?.let(::incomingIndex)
         // An overlap farther down doesn't prove that the refreshed prefix connects to
         // the old head. Track that seam even if the merge could sort by timestamps.
         if (head != null && headIndex == null && ordinary.firstOrNull()?.id !in previousKeys) {
             disconnectedAt = disconnectedAt + head
         }
-        if (previousOrdinary.none { TimelineReadingAnchor.from(it)?.let(::incomingIndex) != null }) {
+        if (previousOrdinary.none { TimelineRefreshPostIdentity.from(it)?.let(::incomingIndex) != null }) {
             disconnectedAt = disconnectedAt + ordinary.zipWithNext().mapNotNull { (newer, older) ->
-                if (newer.id !in previousKeys && older.id in previousKeys) TimelineReadingAnchor.from(older) else null
+                if (newer.id !in previousKeys && older.id in previousKeys) TimelineRefreshPostIdentity.from(older) else null
             }
         }
     }
@@ -4701,16 +4567,13 @@ internal class HomeTimelineReadingState(
     }
 
     fun resetTimelineReadingSession() {
-        cancelReadingResume()
         resetLongPostReading()
         timelineRefreshJob?.cancel()
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
         resetGap()
-        readingRowsOwner = null
-        persistedBoundary = null
-        persistedRefreshBatch = null
-        pauseReadingExposure(waitForUserScroll = false)
+        displayedRowsOwner = null
+        confirmedProjection = null
         disconnectedAt = emptySet()
         timelineVerifiedFromNetwork = false
         items = emptyList()
@@ -4735,7 +4598,6 @@ fun WeiboApp() {
     val homeTimeline = remember {
         HomeTimelineReadingState(
             ReadingPreferencesStore(context), TimelineCacheStore(context), feedDisplaySettingsStore.readTimelineKind(),
-            boundaryStore = TimelineReadingBoundaryStore(context),
         )
     }
     var showCommentLikeCount by remember { mutableStateOf(feedDisplaySettingsStore.readShowCommentLikeCount()) }
@@ -6702,12 +6564,10 @@ fun WeiboApp() {
 
     fun refreshTimeline(
         showRefreshHint: Boolean = true,
-        dockGesture: Boolean = false,
         explicitUserRefresh: Boolean = false,
+        returnToTop: Boolean = false,
     ) {
-        if (dockGesture && homeTimeline.timelineRefreshJob?.isActive == true) return
         homeTimeline.feedRefreshHint = null
-        homeTimeline.cancelReadingResume()
         homeTimeline.timelineRefreshJob?.cancel()
         homeTimeline.timelineLoadMoreJob?.cancel()
         homeTimeline.timelineRequestGeneration += 1
@@ -6722,8 +6582,11 @@ fun WeiboApp() {
             requestedAccountId == activeAccountId && requestedAccountId == accountStore.readActiveAccountId()
 
         val previousItems = homeTimeline.items
-        val previousReadingOwner = homeTimeline.readingScope
-        val startedAtTop = feedListState.isAtHomeTimelineTop()
+        val previousOrderedOwner = homeTimeline.displayedOrderedRoute
+        val refreshVisitGeneration = homeTimeline.explicitRefreshVisitGeneration
+        fun refreshVisitIsCurrent() = selectedTab == MainTab.Feed &&
+            refreshVisitGeneration == homeTimeline.explicitRefreshVisitGeneration
+        val startedAtTop = returnToTop || feedListState.isAtHomeTimelineTop()
         val startedOrdered = requestedKind.hasOrderedRefresh(requestedGroupId, previousItems)
         val explicitOwner = if (explicitUserRefresh) {
             homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
@@ -6732,16 +6595,15 @@ fun WeiboApp() {
             homeTimeline.captureExplicitRefreshBaseline(explicitOwner)
         } else null
         val preserveViewport = previousItems.isNotEmpty() && (explicitUserRefresh || startedOrdered &&
-            (dockGesture || previousReadingOwner != null || homeTimeline.preferences.reverseReading ||
+            (previousOrderedOwner != null || homeTimeline.preferences.reverseReading ||
                 startedAtTop && homeTimeline.hasProtectedReadingProjection))
-        if (explicitBaseline != null) homeTimeline.pauseReadingExposure()
 
         homeTimeline.timelineRefreshJob = scope.launch {
             homeTimeline.isLoading = true
             homeTimeline.feedLoadingMore = false
             hasLoginCookie = session.hasLoginCookie()
             try {
-                if (!explicitUserRefresh && !dockGesture && !preserveViewport && feedListState.layoutInfo.totalItemsCount > 0) {
+                if (!explicitUserRefresh && !preserveViewport && feedListState.layoutInfo.totalItemsCount > 0) {
                     feedListState.animateScrollToTopSmooth()
                 }
                 val requestedOwner = if (explicitUserRefresh) explicitOwner else
@@ -6755,7 +6617,7 @@ fun WeiboApp() {
                             ?: session.loadTimelineRaw(requestedKind)
                         withContext(Dispatchers.Default) {
                             val page = WeiboJsonParser.parseTimeline(raw)
-                            Triple(page, raw, explicitBaseline != null && WeiboJsonParser.hasCompleteTimelineReadingResponse(raw, page))
+                            Triple(page, raw, explicitBaseline != null && WeiboJsonParser.hasCompleteExplicitTimelineResponse(raw, page))
                         }
                     } else {
                         Triple(session.loadTimeline(requestedKind), null, false)
@@ -6768,14 +6630,15 @@ fun WeiboApp() {
                             cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration &&
                                 it == homeTimeline.currentVerifiedTimelineAccount(accountStore, requestedAccountId)
                         }
-                        if ((requestedOwner != null || previousReadingOwner != null) && verifiedOwner == null) return@onSuccess
+                        if ((requestedOwner != null || previousOrderedOwner != null) && verifiedOwner == null) return@onSuccess
                         val orderedResponse = requestedKind.hasOrderedRefresh(requestedGroupId, page.items)
-                        val sameVerifiedBaseline = verifiedOwner != null && previousReadingOwner?.accountId == verifiedOwner &&
-                            previousReadingOwner == homeTimeline.readingScope
+                        val sameVerifiedBaseline = verifiedOwner != null && previousOrderedOwner?.accountId == verifiedOwner &&
+                            previousOrderedOwner == homeTimeline.displayedOrderedRoute
                         val newCount = countNewTimelinePosts(previousItems, page.items, ordered = orderedResponse && startedOrdered)
-                        val legacyNoNewAtTop = showRefreshHint && newCount == 0 &&
-                            !(explicitUserRefresh && (startedOrdered || orderedResponse)) &&
-                            (!orderedResponse || sameVerifiedBaseline) && startedAtTop && feedListState.isAtHomeTimelineTop()
+                        val applyAtTop = returnToTop && refreshVisitIsCurrent()
+                        // Ordered routes show this hint only when a manual refresh confirms zero new posts.
+                        val legacyNoNewAtTop = showRefreshHint && explicitUserRefresh && newCount == 0 &&
+                            !startedOrdered && !orderedResponse && startedAtTop && (applyAtTop || feedListState.isAtHomeTimelineTop())
                         val protectViewport = preserveViewport && homeTimeline.items.isNotEmpty()
                         // Prefer retaining same-owner history even when the explicit result cannot
                         // establish a batch. A ranked or unverified response cannot merge an owned tail.
@@ -6785,23 +6648,24 @@ fun WeiboApp() {
                             showMessage("没有读取到微博", "请稍后刷新")
                             return@onSuccess
                         }
-                        if (sameVerifiedBaseline && !orderedResponse && homeTimeline.hasRefreshReadingDisposition) {
+                        if (sameVerifiedBaseline && !orderedResponse && homeTimeline.hasConfirmedRefresh) {
                             // A standalone Special Following response can temporarily stop being
                             // chronological. Do not replace the active ordered batch with that page.
                             return@onSuccess
                         }
                         if (!keepReading) {
-                            homeTimeline.acceptReadingRows(null, chronological = false)
+                            homeTimeline.acceptOrderedRows(null, chronological = false)
                         }
                         val rolloverCount = homeTimeline.publishRefresh(
                             page, feedListState, protectViewport, keepReading,
-                            dockRefresh = dockGesture, successfulNoNewAtTop = legacyNoNewAtTop,
                             reusePreviousRows = verifiedOwner == null || sameVerifiedBaseline,
                             explicitBaseline = explicitBaseline?.takeIf { selectedTab == MainTab.Feed && sameVerifiedBaseline },
                             explicitResponseVerified = explicitResponseVerified,
+                            returnToTop = applyAtTop,
                         )
-                        val noNewAtTop = legacyNoNewAtTop || (rolloverCount == 0 && startedAtTop && feedListState.isAtHomeTimelineTop())
-                        homeTimeline.acceptReadingRows(verifiedOwner, orderedResponse && homeTimeline.items.isNotEmpty() &&
+                        val noNewAtTop = legacyNoNewAtTop ||
+                            (rolloverCount == 0 && startedAtTop && (applyAtTop || feedListState.isAtHomeTimelineTop()))
+                        homeTimeline.acceptOrderedRows(verifiedOwner, orderedResponse && homeTimeline.items.isNotEmpty() &&
                             requestedKind.hasOrderedRefresh(requestedGroupId, homeTimeline.items))
                         if (page.items.isNotEmpty() || !keepReading) preservedFeedSourceItem = null
                         reconcileFeedLikeState(page.items)
@@ -6817,8 +6681,7 @@ fun WeiboApp() {
                             requestedKind == TimelineKind.Following && requestedGroupId == null && cacheAccountId != null &&
                             cacheAccountId == homeTimeline.timelineCacheAccountId && cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration
                         ) {
-                            // The shared Following cache must not reopen a nonempty stale page
-                            // that cannot resolve the newly persisted batch identities.
+                            // Persist the accepted first-page refresh without caching a fold.
                             if (!keepReading) homeTimeline.followingDiskIds = emptySet()
                             val writtenIds = if (keepReading) {
                                 homeTimeline.cacheStore.mergeFollowingRefresh(cacheAccountId, raw, homeTimeline.items, homeTimeline.nextCursor)
@@ -6844,7 +6707,8 @@ fun WeiboApp() {
                             }
                         } else if (showRefreshHint && refreshHintGeneration == homeTimeline.feedRefreshHintGeneration) {
                             homeTimeline.feedRefreshHint = when {
-                                noNewAtTop && feedListState.isAtHomeTimelineTop() -> FeedNoNewPostsHint
+                                noNewAtTop && refreshVisitIsCurrent() &&
+                                    (applyAtTop || feedListState.isAtHomeTimelineTop()) -> FeedNoNewPostsHint
                                 !protectViewport && newCount != null && newCount > 0 -> "更新了 $newCount 条微博"
                                 else -> null
                             }
@@ -6870,7 +6734,7 @@ fun WeiboApp() {
                     homeTimeline.timelineRefreshJob = null
                 }
             }
-            if (!explicitUserRefresh && !dockGesture && !preserveViewport && routeIsCurrent() && feedListState.layoutInfo.totalItemsCount > 0) {
+            if (!explicitUserRefresh && !preserveViewport && routeIsCurrent() && feedListState.layoutInfo.totalItemsCount > 0) {
                 feedListState.animateScrollToTopSmooth()
             }
         }
@@ -6952,8 +6816,8 @@ fun WeiboApp() {
                     if (!requestedKind.hasOrderedRefresh(requestedGroupId, merged)) {
                         // Standalone Special Following can return a non-chronological tail.
                         // Do not append it to an active ordered batch or deactivate its owner.
-                        if (homeTimeline.hasRefreshReadingDisposition) return@onSuccess
-                        homeTimeline.acceptReadingRows(null, chronological = false)
+                        if (homeTimeline.hasConfirmedRefresh) return@onSuccess
+                        homeTimeline.acceptOrderedRows(null, chronological = false)
                     }
                     homeTimeline.items = merged
                     reconcileFeedLikeState(page.items)
@@ -8518,7 +8382,7 @@ fun WeiboApp() {
                     homeTimeline.timelineKind == TimelineKind.Following && homeTimeline.selectedTimelineGroupId == null
             }?.let { page ->
                 homeTimeline.items = sortFeedTimelineItems(page.items)
-                homeTimeline.acceptReadingRows(accountId, chronological = true)
+                homeTimeline.acceptOrderedRows(accountId, chronological = true)
                 homeTimeline.nextCursor = page.nextCursor
                 homeTimeline.followingDiskIds = homeTimeline.items.mapTo(HashSet()) { it.id }
                 val anchorId = homeTimeline.cacheStore.readFollowingAnchor(accountId)
@@ -9167,12 +9031,6 @@ fun WeiboApp() {
             LocalFeedEmoticonInlineContent provides feedEmoticonInlineContent,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
-            val readingFeedOnTop = selectedTab == MainTab.Feed && hasLoginCookie &&
-                activeAccountId != null && homeTimeline.timelineCacheAccountId == activeAccountId &&
-                selectedItem == null && visitedUserId == null && navOverlayStack.isEmpty() &&
-                navExitPendingKind == null && likeUsersOverlay == null && commentComposeTarget == null &&
-                mediaPreview == null && articleOverlay == null && albumViewerState == null &&
-                !timelineMenuExpanded && message == null
             Box(
                 Modifier.fillMaxSize()
                     .onGloballyPositioned { searchMenuHost = it }
@@ -9408,7 +9266,6 @@ fun WeiboApp() {
                                 hasLoginCookie = hasLoginCookie,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
-                                readingUiOnTop = readingFeedOnTop,
                                 onRefresh = { refreshTimeline(explicitUserRefresh = true) },
                                 onLoadMore = { loadMore() },
                                 onOpenLoginSettings = ::openAccountLoginManagement,
@@ -10567,8 +10424,10 @@ fun WeiboApp() {
                     )
                 }
             }
-            TimelineUnreadHeader(
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = feedRefreshTopInset + 10.dp).zIndex(90f),
+            Box(
+                modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth()
+                    .padding(top = feedRefreshTopInset + 10.dp).zIndex(90f),
+                contentAlignment = Alignment.Center,
             ) {
                 key(homeTimeline.feedRefreshHintGeneration) {
                     AnimatedVisibility(
@@ -10699,16 +10558,14 @@ fun WeiboApp() {
                         onSelectedTimelineClick = {
                             bottomBarVisible = true
                             bottomBarScrollDistance[0] = 0f
-                            if (hasLoginCookie && homeTimeline.currentVerifiedTimelineAccount(accountStore, activeAccountId) != null) {
-                                homeTimeline.onHomeTabReselected(feedListState, scope)
-                            }
+                            homeTimeline.goToTimelineTop(feedListState)
                         },
                         onEntryDoubleClick = {
                             bottomBarVisible = true
                             bottomBarScrollDistance[0] = 0f
-                            // The dock has matched the active item, including Home as an alias
-                            // for whichever timeline is active but not pinned to the dock.
-                            refreshTimeline(dockGesture = true, explicitUserRefresh = true)
+                            homeTimeline.goToTimelineTopAndRefresh(feedListState) {
+                                refreshTimeline(explicitUserRefresh = true, returnToTop = true)
+                            }
                         },
                         profileAvatar = resolveViboDockAvatarRequest(
                             homeTimeline.timelineCacheAccountId, activeAccountId, hasLoginCookie, mineProfile, storedAccounts,
@@ -10716,7 +10573,6 @@ fun WeiboApp() {
                     ),
                     onTabChange = tabChange@{ tab ->
                         if (tab != MainTab.Feed && selectedTab == MainTab.Feed) {
-                            homeTimeline.cancelReadingResume()
                             homeTimeline.leaveExplicitRefreshVisit()
                         }
                         if (tab == MainTab.Search && selectedTab != MainTab.Search) {
@@ -11521,7 +11377,6 @@ internal fun FollowFeedScreen(
     onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
-    readingUiOnTop: Boolean = feedUiOnTop && hasLoginCookie,
 ) {
     val topInset = WindowInsets.statusBarsIgnoringVisibility.asPaddingValues().calculateTopPadding()
 
@@ -11564,14 +11419,6 @@ internal fun FollowFeedScreen(
         longPostController.retainRows(sourceItems.mapTo(mutableSetOf()) { it.id })
     }
 
-    val readingScroll = remember(homeTimeline) {
-        object : NestedScrollConnection {
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && consumed.y != 0f) homeTimeline.onReadingUserScroll()
-                return Offset.Zero
-            }
-        }
-    }
     val currentOnLoadMore by rememberUpdatedState(onLoadMore)
     val postCount by rememberUpdatedState(items.size)
     val currentDividerIndex by rememberUpdatedState(dividerIndex)
@@ -11580,7 +11427,7 @@ internal fun FollowFeedScreen(
     val feedContent: @Composable BoxScope.() -> Unit = {
         LaunchedEffect(listState) {
             snapshotFlow {
-                if (currentLongPostController.isLayoutPagingSuppressed || homeTimeline.resumeInProgress) return@snapshotFlow false
+                if (currentLongPostController.isLayoutPagingSuppressed) return@snapshotFlow false
                 val dividerRow = currentDividerIndex
                 val lastPost = listState.layoutInfo.visibleItemsInfo.lastOrNull {
                     it.key != FeedReverseBrowseGapKey && it.key != "feed-empty" && it.key != "feed-loading"
@@ -11596,12 +11443,12 @@ internal fun FollowFeedScreen(
         LazyColumn(
             state = listState,
             flingBehavior = rememberWeiboListFlingBehavior(),
-            modifier = Modifier.fillMaxSize().nestedScroll(readingScroll).feedScrollIndicator(
+            modifier = Modifier.fillMaxSize().feedScrollIndicator(
                 state = listState,
                 rows = FeedScrollRows(
                     postCount = items.size,
                     dividerIndex = dividerIndex,
-                    collapsedPostCount = if (timelineGapExpanded) 0 else timelineGap?.hiddenPostCount ?: 0,
+                    collapsedPostCount = timelineGap?.hiddenPostCount ?: 0,
                 ),
                 topInset = topInset,
                 bottomInset = scrollIndicatorBottomInset,
@@ -11617,7 +11464,7 @@ internal fun FollowFeedScreen(
                         body = if (isGroupTimeline) {
                             null
                         } else if (hasLoginCookie) {
-                            "\u5DF2\u68C0\u6D4B\u5230\u5FAE\u535A\u767B\u5F55\u6001\u3002\u4E0B\u62C9\u6216\u70B9\u51FB\u5E95\u90E8\u9996\u9875\u6309\u94AE\uFF0C\u5373\u53EF\u540C\u6B65\u5173\u6CE8\u4FE1\u606F\u6D41\u3002"
+                            "\u5DF2\u68C0\u6D4B\u5230\u5FAE\u535A\u767B\u5F55\u6001\u3002\u4E0B\u62C9\u5237\u65B0\u5373\u53EF\u540C\u6B65\u5173\u6CE8\u4FE1\u606F\u6D41\u3002"
                         } else {
                             "\u672C\u5730\u8FD8\u6CA1\u6709\u7F13\u5B58\u7684\u4FE1\u606F\u6D41\u3002\u8BF7\u5230\u6211\u7684\u9875\u9762\u7684\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\u3002"
                         },
@@ -11643,10 +11490,10 @@ internal fun FollowFeedScreen(
                     if (timelineGap == null) {
                         FeedNewPostsMarker()
                     } else {
-                        FeedReverseBrowseDivider(timelineGap.hiddenPostCount, timelineGapExpanded) {
-                            // A layout-only toggle must not be mistaken for scrolling to the tail.
+                        FeedReverseBrowseDivider(timelineGap.hiddenPostCount) {
+                            // Revealing rows must not be mistaken for scrolling to the tail.
                             longPostController.suppressPagingForLayoutChange()
-                            homeTimeline.toggleTimelineGap(listState)
+                            homeTimeline.expandTimelineGap(listState)
                         }
                     }
                     return@items
@@ -11697,7 +11544,6 @@ internal fun FollowFeedScreen(
         modifier = Modifier.fillMaxSize(),
     ) {
         feedContent()
-        ObserveTimelineReadingBoundary(homeTimeline, listState, readingUiOnTop, topContentInsetPx, navTopInRoot)
         // A detail covers the still-mounted feed. Keep its readable viewport so the
         // expanded source card has the same collapse control at the return handoff.
         if (lineLimit != null) {
@@ -11725,22 +11571,18 @@ private fun FeedNewPostsMarker() {
 }
 
 @Composable
-private fun FeedReverseBrowseDivider(postCount: Int, expanded: Boolean, onToggle: () -> Unit) {
+private fun FeedReverseBrowseDivider(postCount: Int, onExpand: () -> Unit) {
     val dividerColor = MaterialTheme.colorScheme.outlineVariant
-    val expandedState = stringResource(
-        if (expanded) R.string.feed_reverse_browse_gap_expanded else R.string.feed_reverse_browse_gap_collapsed,
-    )
+    val collapsedState = stringResource(R.string.feed_reverse_browse_gap_collapsed)
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 48.dp)
-            .semantics { stateDescription = expandedState }
+            .semantics { stateDescription = collapsedState }
             .clickable(
                 role = Role.Button,
-                onClickLabel = stringResource(
-                    if (expanded) R.string.feed_reverse_browse_gap_collapse else R.string.feed_reverse_browse_gap_expand,
-                ),
-                onClick = onToggle,
+                onClickLabel = stringResource(R.string.feed_reverse_browse_gap_expand),
+                onClick = onExpand,
             )
             .padding(horizontal = 16.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -11749,17 +11591,14 @@ private fun FeedReverseBrowseDivider(postCount: Int, expanded: Boolean, onToggle
         HorizontalDivider(Modifier.weight(1f), color = dividerColor)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = stringResource(
-                    if (expanded) R.string.feed_reverse_browse_gap_open else R.string.feed_reverse_browse_gap,
-                    postCount,
-                ),
+                text = stringResource(R.string.feed_reverse_browse_gap, postCount),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Icon(
                 painter = painterResource(R.drawable.ic_chevron_down),
                 contentDescription = null,
-                modifier = Modifier.size(16.dp).graphicsLayer { rotationZ = if (expanded) 180f else 0f },
+                modifier = Modifier.size(16.dp).graphicsLayer { rotationZ = 180f },
                 tint = MaterialTheme.colorScheme.onSurface,
             )
         }
@@ -26317,7 +26156,8 @@ private val appHelpSections = listOf(
         items = listOf(
             "搜索和我的位于底栏两侧；中间项目可在「设置 → 外观与底栏 → 底栏」中调整。",
             "长按支持切换的时间线图标，可查看可用时间线或自定义分组；开启「显示图标文字」后，图标下方显示名称。",
-            "下拉刷新当前信息流，接近列表末尾时自动加载更多；刷新成功会显示更新条数提示。",
+            "单击当前时间线回到顶部，不刷新；双击回到顶部并刷新。单击其他时间线切换栏目。",
+            "也可以在顶部下拉刷新。确认有新微博后，按省流设置折叠本次刷新中的新微博；接近列表末尾时自动加载更多。",
             "「自动隐藏底栏」开启时，在信息流上滑隐藏、下滑显示；关闭后滚动时保持显示。",
             "首页连续按两次返回可退出应用。",
         ),
